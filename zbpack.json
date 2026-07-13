@@ -1,0 +1,4 @@
+{
+  "build_command": "python -m unittest discover -s tests -v",
+  "start_command": "python server.py"
+}
