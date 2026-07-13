@@ -7,12 +7,17 @@ read-only-by-default behavior, safer networking defaults, validation and tests.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
+import html
 import http.server
 import json
 import logging
 import os
+import secrets
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +44,14 @@ READ_ONLY = os.environ.get("MCP_READ_ONLY", "true").strip().lower() not in {
 }
 ALLOWED_ORIGIN = os.environ.get("MCP_ALLOWED_ORIGIN", "").strip()
 MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
+PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
+OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
+OAUTH_SCOPE = "netease.read" if READ_ONLY else "netease.read netease.write"
 SESSION_ID = str(uuid.uuid4())
+USED_AUTHORIZATION_CODES: dict[str, int] = {}
+USED_CODES_LOCK = threading.Lock()
+FAILED_LOGINS: dict[str, list[int]] = {}
+FAILED_LOGINS_LOCK = threading.Lock()
 
 READ_TOOL_NAMES = {
     "search_song",
@@ -414,7 +426,7 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "2.1.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.0.0"},
             },
         }
     if method == "tools/list":
@@ -439,8 +451,222 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def oauth_enabled() -> bool:
+    """Return whether browser-based OAuth is configured for remote MCP clients."""
+    return bool(PUBLIC_URL and OAUTH_PASSWORD)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _oauth_key() -> bytes:
+    return hmac.new(ACCESS_TOKEN.encode(), b"netease-mcp-oauth-v1", hashlib.sha256).digest()
+
+
+def _sign_claims(claims: dict[str, Any]) -> str:
+    payload = _b64url(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    signature = _b64url(hmac.new(_oauth_key(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + signature
+
+
+def _verify_claims(token: str, expected_type: str) -> dict[str, Any] | None:
+    try:
+        payload, signature = token.split(".", 1)
+        expected = _b64url(hmac.new(_oauth_key(), payload.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(signature, expected):
+            return None
+        claims = json.loads(_b64url_decode(payload))
+        if not isinstance(claims, dict) or claims.get("typ") != expected_type:
+            return None
+        if int(claims.get("exp", 0)) < int(time.time()):
+            return None
+        return claims
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _valid_redirect_uri(uri: str) -> bool:
+    if len(uri) > 2048:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except ValueError:
+        return False
+    if parsed.fragment or not parsed.hostname:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def register_oauth_client(payload: dict[str, Any]) -> dict[str, Any]:
+    redirect_uris = payload.get("redirect_uris")
+    if (
+        not isinstance(redirect_uris, list)
+        or not 1 <= len(redirect_uris) <= 10
+        or any(not isinstance(uri, str) or not _valid_redirect_uri(uri) for uri in redirect_uris)
+    ):
+        raise ValueError("redirect_uris must contain valid HTTPS or loopback callback URLs")
+    now = int(time.time())
+    client_id = _sign_claims(
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": now,
+            "exp": now + 365 * 24 * 60 * 60,
+            "jti": secrets.token_urlsafe(12),
+        }
+    )
+    return {
+        "client_id": client_id,
+        "client_id_issued_at": now,
+        "token_endpoint_auth_method": "none",
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    }
+
+
+def validate_authorization_request(params: dict[str, str]) -> tuple[dict[str, Any], str]:
+    client_id = params.get("client_id", "")
+    client = _verify_claims(client_id, "client")
+    if client is None:
+        raise ValueError("invalid client_id")
+    redirect_uri = params.get("redirect_uri", "")
+    if redirect_uri not in client.get("redirect_uris", []):
+        raise ValueError("redirect_uri is not registered")
+    if params.get("response_type") != "code":
+        raise ValueError("response_type must be code")
+    if params.get("code_challenge_method") != "S256" or not params.get("code_challenge"):
+        raise ValueError("PKCE with S256 is required")
+    resource = params.get("resource", PUBLIC_URL + "/mcp")
+    if resource.rstrip("/") != (PUBLIC_URL + "/mcp").rstrip("/"):
+        raise ValueError("invalid resource")
+    requested = set(params.get("scope", "netease.read").split())
+    allowed = set(OAUTH_SCOPE.split())
+    if not requested or not requested.issubset(allowed):
+        raise ValueError("invalid scope")
+    return client, " ".join(sorted(requested))
+
+
+def issue_authorization_code(params: dict[str, str]) -> str:
+    _, scope = validate_authorization_request(params)
+    now = int(time.time())
+    return _sign_claims(
+        {
+            "typ": "code",
+            "client_id": params["client_id"],
+            "redirect_uri": params["redirect_uri"],
+            "code_challenge": params["code_challenge"],
+            "scope": scope,
+            "aud": PUBLIC_URL + "/mcp",
+            "iat": now,
+            "exp": now + 300,
+            "jti": secrets.token_urlsafe(16),
+        }
+    )
+
+
+def _mark_code_used(jti: str, exp: int) -> bool:
+    now = int(time.time())
+    with USED_CODES_LOCK:
+        for key, expiry in list(USED_AUTHORIZATION_CODES.items()):
+            if expiry < now:
+                USED_AUTHORIZATION_CODES.pop(key, None)
+        if jti in USED_AUTHORIZATION_CODES:
+            return False
+        USED_AUTHORIZATION_CODES[jti] = exp
+    return True
+
+
+def _login_allowed(address: str) -> bool:
+    cutoff = int(time.time()) - 15 * 60
+    with FAILED_LOGINS_LOCK:
+        attempts = [stamp for stamp in FAILED_LOGINS.get(address, []) if stamp >= cutoff]
+        FAILED_LOGINS[address] = attempts
+        return len(attempts) < 5
+
+
+def _record_failed_login(address: str) -> None:
+    with FAILED_LOGINS_LOCK:
+        FAILED_LOGINS.setdefault(address, []).append(int(time.time()))
+
+
+def _clear_failed_logins(address: str) -> None:
+    with FAILED_LOGINS_LOCK:
+        FAILED_LOGINS.pop(address, None)
+
+
+def _token_pair(client_id: str, scope: str, include_refresh: bool = True) -> dict[str, Any]:
+    now = int(time.time())
+    access_token = _sign_claims(
+        {
+            "typ": "access",
+            "client_id": client_id,
+            "scope": scope,
+            "aud": PUBLIC_URL + "/mcp",
+            "iat": now,
+            "exp": now + 3600,
+            "jti": secrets.token_urlsafe(12),
+        }
+    )
+    response: dict[str, Any] = {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": scope,
+    }
+    if include_refresh:
+        response["refresh_token"] = _sign_claims(
+            {
+                "typ": "refresh",
+                "client_id": client_id,
+                "scope": scope,
+                "aud": PUBLIC_URL + "/mcp",
+                "iat": now,
+                "exp": now + 30 * 24 * 60 * 60,
+                "jti": secrets.token_urlsafe(16),
+            }
+        )
+    return response
+
+
+def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
+    grant_type = params.get("grant_type")
+    client_id = params.get("client_id", "")
+    if _verify_claims(client_id, "client") is None:
+        raise ValueError("invalid_client")
+    if grant_type == "authorization_code":
+        claims = _verify_claims(params.get("code", ""), "code")
+        if claims is None or claims.get("client_id") != client_id:
+            raise ValueError("invalid_grant")
+        if claims.get("redirect_uri") != params.get("redirect_uri"):
+            raise ValueError("invalid_grant")
+        verifier = params.get("code_verifier", "")
+        if not 43 <= len(verifier) <= 128:
+            raise ValueError("invalid_grant")
+        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        if not hmac.compare_digest(challenge, str(claims.get("code_challenge", ""))):
+            raise ValueError("invalid_grant")
+        if not _mark_code_used(str(claims.get("jti", "")), int(claims["exp"])):
+            raise ValueError("invalid_grant")
+        return _token_pair(client_id, str(claims["scope"]))
+    if grant_type == "refresh_token":
+        claims = _verify_claims(params.get("refresh_token", ""), "refresh")
+        if claims is None or claims.get("client_id") != client_id:
+            raise ValueError("invalid_grant")
+        return _token_pair(client_id, str(claims["scope"]))
+    raise ValueError("unsupported_grant_type")
+
+
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/2.1"
+    server_version = "NetEaseMusicMCP/3.0"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -449,28 +675,110 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
-    def _json(self, payload: dict[str, Any], status: int = 200) -> None:
+    def _json(
+        self,
+        payload: dict[str, Any],
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Mcp-Session-Id", SESSION_ID)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if headers:
+            for name, value in headers.items():
+                self.send_header(name, value)
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _authorized(self) -> bool:
-        if not ACCESS_TOKEN:
-            return False
+    def _html(self, content: str, status: int = 200) -> None:
+        encoded = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _read_body(self) -> bytes:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("invalid_content_length") from None
+        if content_length < 1 or content_length > MAX_REQUEST_BYTES:
+            raise ValueError("invalid_request_size")
+        return self.rfile.read(content_length)
+
+    def _read_form(self) -> dict[str, str]:
+        parsed = urllib.parse.parse_qs(self._read_body().decode("utf-8"), keep_blank_values=True)
+        return {key: values[-1] for key, values in parsed.items()}
+
+    def _static_token_authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
         scheme, _, supplied = header.partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(supplied, ACCESS_TOKEN)
+        return scheme.lower() == "bearer" and bool(supplied) and hmac.compare_digest(supplied, ACCESS_TOKEN)
+
+    def _oauth_access_claims(self) -> dict[str, Any] | None:
+        header = self.headers.get("Authorization", "")
+        scheme, _, supplied = header.partition(" ")
+        if scheme.lower() != "bearer" or not supplied:
+            return None
+        if not oauth_enabled():
+            return None
+        claims = _verify_claims(supplied, "access")
+        if claims is None or claims.get("aud") != PUBLIC_URL + "/mcp":
+            return None
+        return claims
+
+    def _authorized(self) -> bool:
+        if self._static_token_authorized():
+            return True
+        claims = self._oauth_access_claims()
+        return claims is not None and "netease.read" in str(claims.get("scope", "")).split()
 
     def _require_auth(self) -> bool:
         if self._authorized():
             return True
-        self._json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+        headers = {}
+        if oauth_enabled():
+            metadata = PUBLIC_URL + "/.well-known/oauth-protected-resource"
+            headers["WWW-Authenticate"] = (
+                f'Bearer resource_metadata="{metadata}", scope="netease.read"'
+            )
+        self._json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED, headers)
         return False
+
+    def _authorization_page(self, params: dict[str, str], error: str = "") -> None:
+        try:
+            validate_authorization_request(params)
+        except ValueError as exc:
+            self._html("<h1>Invalid authorization request</h1><p>" + html.escape(str(exc)) + "</p>", 400)
+            return
+        hidden = "".join(
+            f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
+            for key, value in params.items()
+            if key != "password"
+        )
+        error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+        self._html(
+            "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\">"
+            "<title>Authorize Rain Music Room</title><style>"
+            "body{font:16px system-ui;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#202124}"
+            "form{display:grid;gap:1rem}input,button{font:inherit;padding:.75rem}button{cursor:pointer}"
+            ".error{color:#b3261e}</style></head><body>"
+            "<h1>Rain Music Room</h1>"
+            "<p>Authorize read-only access to your NetEase playlists, history, search and recommendations.</p>"
+            + error_html
+            + '<form method="post" action="/authorize">'
+            + hidden
+            + '<label>Private login password <input type="password" name="password" required autocomplete="current-password"></label>'
+            + '<button type="submit">Authorize once</button></form></body></html>'
+        )
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -478,29 +786,118 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/health":
             self._json({"status": "ok", "mode": "read-only" if READ_ONLY else "read-write"})
+            return
+        if oauth_enabled() and path in {
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        }:
+            self._json(
+                {
+                    "resource": PUBLIC_URL + "/mcp",
+                    "authorization_servers": [PUBLIC_URL],
+                    "scopes_supported": OAUTH_SCOPE.split(),
+                    "bearer_methods_supported": ["header"],
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+            return
+        if oauth_enabled() and path == "/.well-known/oauth-authorization-server":
+            self._json(
+                {
+                    "issuer": PUBLIC_URL,
+                    "authorization_endpoint": PUBLIC_URL + "/authorize",
+                    "token_endpoint": PUBLIC_URL + "/token",
+                    "registration_endpoint": PUBLIC_URL + "/register",
+                    "scopes_supported": OAUTH_SCOPE.split(),
+                    "response_types_supported": ["code"],
+                    "response_modes_supported": ["query"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                    "code_challenge_methods_supported": ["S256"],
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+            return
+        if oauth_enabled() and path == "/authorize":
+            params = {key: values[-1] for key, values in urllib.parse.parse_qs(parsed.query).items()}
+            self._authorization_page(params)
             return
         self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/mcp":
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+        if oauth_enabled() and path == "/register":
+            try:
+                payload = json.loads(self._read_body())
+                if not isinstance(payload, dict):
+                    raise ValueError("registration body must be an object")
+                self._json(register_oauth_client(payload), HTTPStatus.CREATED, {"Cache-Control": "no-store"})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json({"error": "invalid_client_metadata", "error_description": str(exc)}, 400)
+            return
+        if oauth_enabled() and path == "/authorize":
+            try:
+                params = self._read_form()
+                supplied = params.pop("password", "")
+                validate_authorization_request(params)
+                address = self.client_address[0]
+                if not _login_allowed(address):
+                    self._html("<h1>Too many attempts</h1><p>Try again in 15 minutes.</p>", 429)
+                    return
+                if not hmac.compare_digest(supplied, OAUTH_PASSWORD):
+                    _record_failed_login(address)
+                    self._authorization_page(params, "Incorrect password")
+                    return
+                _clear_failed_logins(address)
+                code = issue_authorization_code(params)
+                query = {"code": code}
+                if params.get("state"):
+                    query["state"] = params["state"]
+                separator = "&" if "?" in params["redirect_uri"] else "?"
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", params["redirect_uri"] + separator + urllib.parse.urlencode(query))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._html("<h1>Authorization failed</h1><p>" + html.escape(str(exc)) + "</p>", 400)
+            return
+        if oauth_enabled() and path == "/token":
+            try:
+                params = self._read_form()
+                self._json(exchange_oauth_token(params), headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+            except (ValueError, UnicodeDecodeError) as exc:
+                error = str(exc)
+                status = HTTPStatus.UNAUTHORIZED if error == "invalid_client" else HTTPStatus.BAD_REQUEST
+                self._json({"error": error}, status, {"Cache-Control": "no-store", "Pragma": "no-cache"})
+            return
+        if path != "/mcp":
             self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
             return
         if not self._require_auth():
             return
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._json({"error": "invalid_content_length"}, HTTPStatus.BAD_REQUEST)
-            return
-        if content_length < 1 or content_length > MAX_REQUEST_BYTES:
-            self._json({"error": "invalid_request_size"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-            return
-        try:
-            body = json.loads(self.rfile.read(content_length))
+            body = json.loads(self._read_body())
             if not isinstance(body, dict):
                 raise ValueError("JSON-RPC request must be an object.")
+            if body.get("method") == "tools/call":
+                params = body.get("params") or {}
+                tool_name = str(params.get("name", "")) if isinstance(params, dict) else ""
+                if tool_name in WRITE_TOOL_NAMES and not self._static_token_authorized():
+                    claims = self._oauth_access_claims() or {}
+                    if "netease.write" not in str(claims.get("scope", "")).split():
+                        self._json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": body.get("id"),
+                                "error": {"code": -32003, "message": "netease.write scope is required"},
+                            },
+                            HTTPStatus.FORBIDDEN,
+                        )
+                        return
             if body.get("id") is None or str(body.get("method", "")).startswith("notifications/"):
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self._cors()
@@ -552,6 +949,24 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_ACCESS_TOKEN before starting.")
     if MAX_REQUEST_BYTES < 1024:
         raise SystemExit("MCP_MAX_REQUEST_BYTES must be at least 1024.")
+    if bool(PUBLIC_URL) != bool(OAUTH_PASSWORD):
+        raise SystemExit("Set both MCP_PUBLIC_URL and MCP_OAUTH_PASSWORD, or neither.")
+    if PUBLIC_URL and not PUBLIC_URL.startswith("https://"):
+        raise SystemExit("MCP_PUBLIC_URL must use HTTPS.")
+    if PUBLIC_URL:
+        parsed_public_url = urllib.parse.urlsplit(PUBLIC_URL)
+        if parsed_public_url.path not in {"", "/"} or parsed_public_url.query or parsed_public_url.fragment:
+            raise SystemExit("MCP_PUBLIC_URL must be an HTTPS origin without a path, query or fragment.")
+    if OAUTH_PASSWORD and len(OAUTH_PASSWORD) < 16:
+        raise SystemExit("MCP_OAUTH_PASSWORD must be at least 16 characters.")
+    if OAUTH_PASSWORD.lower() in {
+        "replace_with_a_different_random_password",
+        "change-me",
+        "changeme",
+    }:
+        raise SystemExit("Replace the example MCP_OAUTH_PASSWORD before starting.")
+    if OAUTH_PASSWORD and hmac.compare_digest(OAUTH_PASSWORD, ACCESS_TOKEN):
+        raise SystemExit("MCP_OAUTH_PASSWORD must be different from MCP_ACCESS_TOKEN.")
 
 
 def main() -> None:

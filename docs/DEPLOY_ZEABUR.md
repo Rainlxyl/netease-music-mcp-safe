@@ -14,6 +14,8 @@ is the repository root. `zbpack.json` runs the tests during build and starts `py
 | --- | --- |
 | `NETEASE_COOKIE` | `MUSIC_U=...; __csrf=...` |
 | `MCP_ACCESS_TOKEN` | A random value of at least 24 characters |
+| `MCP_PUBLIC_URL` | `https://YOUR-DOMAIN.zeabur.app` |
+| `MCP_OAUTH_PASSWORD` | A different random password of at least 16 characters |
 | `MCP_HOST` | `0.0.0.0` |
 | `MCP_READ_ONLY` | `true` |
 | `LOG_LEVEL` | `INFO` |
@@ -31,6 +33,10 @@ is:
 
 The MCP endpoint is `https://YOUR-DOMAIN/mcp`. Opening it in a normal browser is not a valid MCP
 test because the endpoint accepts authenticated JSON-RPC POST requests.
+
+`MCP_OAUTH_PASSWORD` is entered only in the server's authorization page. Do not put it in GitHub,
+plugin files, screenshots or chat. A successful OAuth login issues a one-hour access token and a
+30-day refresh token, so users are not expected to sign in daily.
 
 ## 4. Keep the first deployment read-only
 

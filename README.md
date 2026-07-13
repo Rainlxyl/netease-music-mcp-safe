@@ -7,6 +7,7 @@ Cloud Music account. It is derived from
 ## Safety changes
 
 - Bearer-token authentication is mandatory; the server refuses to start without it.
+- Optional OAuth 2.1 authorization supports hosted MCP clients without embedding a bearer token.
 - Read-only mode is enabled by default and hides all account-changing tools.
 - Local use binds to `127.0.0.1` by default.
 - Public wildcard CORS is removed.
@@ -48,8 +49,16 @@ Set the following environment variables in Zeabur's dashboard, never in Git:
 - `MCP_ACCESS_TOKEN`: a random secret of at least 24 characters
 - `MCP_READ_ONLY`: keep `true` for the first deployment
 - `MCP_HOST`: `0.0.0.0`
+- `MCP_PUBLIC_URL`: public HTTPS origin, for example `https://YOUR-SERVICE.zeabur.app`
+- `MCP_OAUTH_PASSWORD`: a separate random password of at least 16 characters for one-time browser authorization
 
 The MCP endpoint will be `https://YOUR-SERVICE.zeabur.app/mcp`.
+
+When both OAuth variables are set, compatible remote clients discover OAuth automatically from the
+server's protected-resource metadata. The user enters `MCP_OAUTH_PASSWORD` in the authorization
+page once; access tokens last one hour and refresh automatically for up to 30 days. Reauthorization
+is normally required only after the refresh token expires, credentials are changed, or authorization
+is revoked. Keep the original `MCP_ACCESS_TOKEN`: local Codex clients can continue using it.
 
 ## Important limitations
 

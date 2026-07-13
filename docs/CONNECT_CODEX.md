@@ -21,6 +21,15 @@ tool_timeout_sec = 30
 
 Restart the client after saving, then use `/mcp` to confirm the server is connected.
 
-ChatGPT Work on the web uses a plugin containing this remote MCP configuration. That plugin is
-generated only after the final Zeabur domain is known, so it does not ship with a fake endpoint.
+## Connect ChatGPT Work on the web
 
+Configure `MCP_PUBLIC_URL` and `MCP_OAUTH_PASSWORD` on the server first. Then in ChatGPT:
+
+1. Open **Settings → Security and login** and enable **Developer mode**.
+2. Open **Settings → Plugins**, select the plus button, and create a developer-mode app.
+3. Enter `https://YOUR-DOMAIN/mcp` and choose OAuth/discovered authentication.
+4. Complete the browser authorization page with `MCP_OAUTH_PASSWORD`.
+
+Hosted Work cannot read an environment variable from the user's computer, so do not add a static
+`Authorization` header to a plugin manifest. The bearer-token configuration above remains available
+for local Codex clients.
