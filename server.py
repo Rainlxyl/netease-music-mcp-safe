@@ -73,6 +73,8 @@ def _tool(
     description: str,
     properties: dict[str, Any] | None = None,
     required: list[str] | None = None,
+    read_only: bool = True,
+    destructive: bool = False,
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -81,7 +83,16 @@ def _tool(
     }
     if required:
         schema["required"] = required
-    return {"name": name, "description": description, "inputSchema": schema}
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": schema,
+        "annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "openWorldHint": True,
+        },
+    }
 
 
 READ_TOOLS = [
@@ -122,6 +133,7 @@ WRITE_TOOLS = [
             "privacy": {"type": "integer", "enum": [0, 10], "default": 10},
         },
         ["name"],
+        read_only=False,
     ),
     _tool(
         "add_to_playlist",
@@ -136,6 +148,7 @@ WRITE_TOOLS = [
             },
         },
         ["playlist_id", "song_ids"],
+        read_only=False,
     ),
     _tool(
         "remove_from_playlist",
@@ -150,6 +163,8 @@ WRITE_TOOLS = [
             },
         },
         ["playlist_id", "song_ids"],
+        read_only=False,
+        destructive=True,
     ),
     _tool(
         "like_song",
@@ -159,6 +174,8 @@ WRITE_TOOLS = [
             "like": {"type": "boolean", "default": True},
         },
         ["song_id"],
+        read_only=False,
+        destructive=True,
     ),
 ]
 
@@ -666,7 +683,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/3.0"
+    server_version = "NetEaseMusicMCP/3.1"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -748,7 +765,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if oauth_enabled():
             metadata = PUBLIC_URL + "/.well-known/oauth-protected-resource"
             headers["WWW-Authenticate"] = (
-                f'Bearer resource_metadata="{metadata}", scope="netease.read"'
+                f'Bearer resource_metadata="{metadata}", scope="{OAUTH_SCOPE}"'
             )
         self._json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED, headers)
         return False
@@ -759,23 +776,39 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         except ValueError as exc:
             self._html("<h1>Invalid authorization request</h1><p>" + html.escape(str(exc)) + "</p>", 400)
             return
+        requested_scopes = set(params.get("scope", "netease.read").split())
+        write_requested = "netease.write" in requested_scopes
         hidden = "".join(
             f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
             for key, value in params.items()
-            if key != "password"
+            if key not in {"password", "confirm_write"}
         )
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+        access_text = (
+            "Authorize access to read your NetEase music data and to create playlists, add or remove "
+            "playlist tracks, and like or unlike songs. ChatGPT will still apply its confirmation "
+            "settings before write actions."
+            if write_requested
+            else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
+        )
+        write_confirmation = (
+            '<label class="warning"><input type="checkbox" name="confirm_write" value="yes" required> '
+            "I understand this grants permission to modify my NetEase account.</label>"
+            if write_requested
+            else ""
+        )
         self._html(
             "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\">"
             "<title>Authorize Rain Music Room</title><style>"
             "body{font:16px system-ui;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#202124}"
             "form{display:grid;gap:1rem}input,button{font:inherit;padding:.75rem}button{cursor:pointer}"
-            ".error{color:#b3261e}</style></head><body>"
+            ".error,.warning{color:#b3261e}</style></head><body>"
             "<h1>Rain Music Room</h1>"
-            "<p>Authorize read-only access to your NetEase playlists, history, search and recommendations.</p>"
+            "<p>" + access_text + "</p>"
             + error_html
             + '<form method="post" action="/authorize">'
             + hidden
+            + write_confirmation
             + '<label>Private login password <input type="password" name="password" required autocomplete="current-password"></label>'
             + '<button type="submit">Authorize once</button></form></body></html>'
         )
@@ -843,7 +876,11 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             try:
                 params = self._read_form()
                 supplied = params.pop("password", "")
+                confirm_write = params.pop("confirm_write", "")
                 validate_authorization_request(params)
+                if "netease.write" in params.get("scope", "").split() and confirm_write != "yes":
+                    self._authorization_page(params, "Confirm write access before continuing")
+                    return
                 address = self.client_address[0]
                 if not _login_allowed(address):
                     self._html("<h1>Too many attempts</h1><p>Try again in 15 minutes.</p>", 429)

@@ -30,6 +30,10 @@ Configure `MCP_PUBLIC_URL` and `MCP_OAUTH_PASSWORD` on the server first. Then in
 3. Enter `https://YOUR-DOMAIN/mcp` and choose OAuth/discovered authentication.
 4. Complete the browser authorization page with `MCP_OAUTH_PASSWORD`.
 
+If the server is later changed from read-only to write mode, refresh the app's tool definitions,
+disconnect it, and reconnect it. Existing refresh tokens retain their original read-only scope and
+must not be silently upgraded. The new authorization page will explicitly request write access.
+
 Hosted Work cannot read an environment variable from the user's computer, so do not add a static
 `Authorization` header to a plugin manifest. The bearer-token configuration above remains available
 for local Codex clients.

@@ -54,6 +54,17 @@ Set the following environment variables in Zeabur's dashboard, never in Git:
 
 The MCP endpoint will be `https://YOUR-SERVICE.zeabur.app/mcp`.
 
+### Optional write mode
+
+After all read tools have been tested, set `MCP_READ_ONLY=false` to expose four account-changing
+tools: create a playlist, add tracks, remove tracks, and like or unlike a song. The OAuth page then
+shows a separate write-access warning and requires explicit confirmation. Disconnect and reconnect
+the ChatGPT app after changing this setting so it obtains the new `netease.write` scope. Keep
+ChatGPT's write-action confirmations enabled while testing.
+
+Remote MCP cannot make a particular phone or computer start playback. Playback requires a local
+player or device-control integration and is intentionally outside this hosted server.
+
 When both OAuth variables are set, compatible remote clients discover OAuth automatically from the
 server's protected-resource metadata. The user enters `MCP_OAUTH_PASSWORD` in the authorization
 page once; access tokens last one hour and refresh automatically for up to 30 days. Reauthorization

@@ -42,6 +42,20 @@ class ToolTests(unittest.TestCase):
         names = {tool["name"] for tool in module.available_tools()}
         self.assertEqual(names, module.READ_TOOL_NAMES | module.WRITE_TOOL_NAMES)
 
+    def test_tool_annotations_distinguish_reads_and_writes(self):
+        module = load_server("false")
+        tools = {tool["name"]: tool for tool in module.available_tools()}
+        for name in module.READ_TOOL_NAMES:
+            self.assertTrue(tools[name]["annotations"]["readOnlyHint"])
+        for name in module.WRITE_TOOL_NAMES:
+            self.assertFalse(tools[name]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools["remove_from_playlist"]["annotations"]["destructiveHint"])
+        self.assertTrue(tools["like_song"]["annotations"]["destructiveHint"])
+
+    def test_write_mode_advertises_write_oauth_scope(self):
+        module = load_server("false", oauth=True)
+        self.assertEqual(module.OAUTH_SCOPE, "netease.read netease.write")
+
     def test_read_only_rejects_direct_write_call(self):
         module = load_server("true")
         with self.assertRaises(PermissionError):
