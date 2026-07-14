@@ -18,8 +18,8 @@ Cloud Music account. It is derived from
 ## Available tools
 
 Read-only mode provides search, playlist listing, playlist contents, play history and daily
-recommendations. Read-write mode additionally provides playlist creation, track addition/removal,
-and like/unlike.
+recommendations. Read-write mode additionally provides playlist creation, playlist name/description
+editing, track addition/removal, and like/unlike.
 
 ## Local development
 
@@ -56,8 +56,8 @@ The MCP endpoint will be `https://YOUR-SERVICE.zeabur.app/mcp`.
 
 ### Optional write mode
 
-After all read tools have been tested, set `MCP_READ_ONLY=false` to expose four account-changing
-tools: create a playlist, add tracks, remove tracks, and like or unlike a song. The OAuth page then
+After all read tools have been tested, set `MCP_READ_ONLY=false` to expose five account-changing
+tools: create or edit a playlist, add tracks, remove tracks, and like or unlike a song. The OAuth page then
 shows a separate write-access warning and requires explicit confirmation. Disconnect and reconnect
 the ChatGPT app after changing this setting so it obtains the new `netease.write` scope. Keep
 ChatGPT's write-action confirmations enabled while testing.

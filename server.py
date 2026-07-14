@@ -62,6 +62,7 @@ READ_TOOL_NAMES = {
 }
 WRITE_TOOL_NAMES = {
     "create_playlist",
+    "update_playlist",
     "add_to_playlist",
     "remove_from_playlist",
     "like_song",
@@ -75,6 +76,7 @@ def _tool(
     required: list[str] | None = None,
     read_only: bool = True,
     destructive: bool = False,
+    min_properties: int | None = None,
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -83,6 +85,8 @@ def _tool(
     }
     if required:
         schema["required"] = required
+    if min_properties is not None:
+        schema["minProperties"] = min_properties
     return {
         "name": name,
         "description": description,
@@ -134,6 +138,18 @@ WRITE_TOOLS = [
         },
         ["name"],
         read_only=False,
+    ),
+    _tool(
+        "update_playlist",
+        "Update the name and/or description of a playlist owned by the user. At least one of name or description must be provided. This changes the NetEase account.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "name": {"type": "string", "minLength": 1, "maxLength": 80},
+            "description": {"type": "string", "maxLength": 1000},
+        },
+        ["playlist_id"],
+        read_only=False,
+        min_properties=2,
     ),
     _tool(
         "add_to_playlist",
@@ -390,6 +406,53 @@ def manipulate_playlist(operation: str, playlist_id: Any, song_ids: Any) -> str:
     return f"{verb} {len(ids)} song(s) {'to' if operation == 'add' else 'from'} playlist {playlist_id}."
 
 
+def update_playlist(
+    playlist_id: Any,
+    name: Any = None,
+    description: Any = None,
+) -> str:
+    playlist_id = _positive_int(playlist_id, "playlist_id")
+    if name is None and description is None:
+        raise ValueError("At least one of name or description must be provided.")
+
+    clean_name: str | None = None
+    if name is not None:
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            raise ValueError("name must be between 1 and 80 characters.")
+        clean_name = name.strip()
+    if description is not None and (
+        not isinstance(description, str) or len(description) > 1000
+    ):
+        raise ValueError("description must be a string up to 1000 characters.")
+
+    updated: list[str] = []
+    csrf = get_csrf()
+    if clean_name is not None:
+        response = netease_request(
+            "https://music.163.com/api/playlist/update/name?csrf_token=" + csrf,
+            data={"id": str(playlist_id), "name": clean_name},
+        )
+        if response.get("code") != 200:
+            raise NetEaseError(response.get("message") or "Playlist name update failed.")
+        updated.append("name")
+
+    if description is not None:
+        response = netease_request(
+            "https://music.163.com/api/playlist/desc/update?csrf_token=" + csrf,
+            data={"id": str(playlist_id), "desc": description},
+        )
+        if response.get("code") != 200:
+            message = response.get("message") or "Playlist description update failed."
+            if updated:
+                raise NetEaseError(
+                    f"Playlist name was updated, but the description was not: {message}"
+                )
+            raise NetEaseError(message)
+        updated.append("description")
+
+    return f"Updated playlist {playlist_id}: {', '.join(updated)}."
+
+
 def like_song(song_id: Any, like: Any = True) -> str:
     song_id = _positive_int(song_id, "song_id")
     if not isinstance(like, bool):
@@ -424,6 +487,12 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         return create_playlist(
             arguments.get("name"), arguments.get("description", ""), arguments.get("privacy", 10)
         )
+    if name == "update_playlist":
+        return update_playlist(
+            arguments.get("playlist_id"),
+            arguments.get("name"),
+            arguments.get("description"),
+        )
     if name == "add_to_playlist":
         return manipulate_playlist("add", arguments.get("playlist_id"), arguments.get("song_ids"))
     if name == "remove_from_playlist":
@@ -443,7 +512,7 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.0.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.2.0"},
             },
         }
     if method == "tools/list":
@@ -683,7 +752,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/3.1"
+    server_version = "NetEaseMusicMCP/3.2"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -785,9 +854,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         )
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
         access_text = (
-            "Authorize access to read your NetEase music data and to create playlists, add or remove "
-            "playlist tracks, and like or unlike songs. ChatGPT will still apply its confirmation "
-            "settings before write actions."
+            "Authorize access to read your NetEase music data and to create playlists, edit playlist "
+            "names or descriptions, add or remove playlist tracks, and like or unlike songs. ChatGPT "
+            "will still apply its confirmation settings before write actions."
             if write_requested
             else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
         )

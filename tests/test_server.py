@@ -51,6 +51,8 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(tools[name]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["remove_from_playlist"]["annotations"]["destructiveHint"])
         self.assertTrue(tools["like_song"]["annotations"]["destructiveHint"])
+        self.assertFalse(tools["update_playlist"]["annotations"]["destructiveHint"])
+        self.assertEqual(tools["update_playlist"]["inputSchema"]["minProperties"], 2)
 
     def test_write_mode_advertises_write_oauth_scope(self):
         module = load_server("false", oauth=True)
@@ -79,6 +81,38 @@ class ToolTests(unittest.TestCase):
         module = load_server("false")
         with self.assertRaises(ValueError):
             module._song_ids("1,2")
+
+    def test_update_playlist_requires_a_change(self):
+        module = load_server("false")
+        with self.assertRaises(ValueError):
+            module.update_playlist(123)
+
+    def test_update_playlist_updates_name_and_description(self):
+        module = load_server("false")
+        responses = [{"code": 200}, {"code": 200}]
+        with mock.patch.object(module, "netease_request", side_effect=responses) as request:
+            result = module.update_playlist(123, "  Night Signals  ", "For late listening.")
+        self.assertEqual(result, "Updated playlist 123: name, description.")
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("/api/playlist/update/name", request.call_args_list[0].args[0])
+        self.assertEqual(
+            request.call_args_list[0].kwargs["data"],
+            {"id": "123", "name": "Night Signals"},
+        )
+        self.assertIn("/api/playlist/desc/update", request.call_args_list[1].args[0])
+        self.assertEqual(
+            request.call_args_list[1].kwargs["data"],
+            {"id": "123", "desc": "For late listening."},
+        )
+
+    def test_update_playlist_can_clear_description(self):
+        module = load_server("false")
+        with mock.patch.object(module, "netease_request", return_value={"code": 200}) as request:
+            result = module.call_tool(
+                "update_playlist", {"playlist_id": 123, "description": ""}
+            )
+        self.assertEqual(result, "Updated playlist 123: description.")
+        self.assertEqual(request.call_args.kwargs["data"], {"id": "123", "desc": ""})
 
 
 class HTTPTests(unittest.TestCase):
