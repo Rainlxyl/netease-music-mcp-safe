@@ -143,8 +143,15 @@ class HTTPTests(unittest.TestCase):
     def test_health_does_not_expose_secrets(self):
         with urllib.request.urlopen(self.base + "/health", timeout=2) as response:
             body = response.read().decode()
+            self.assertIsNone(response.headers.get("Mcp-Session-Id"))
         self.assertIn('"status": "ok"', body)
         self.assertNotIn("MUSIC_U", body)
+
+    def test_stateless_mcp_get_returns_method_not_allowed(self):
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(self.base + "/mcp", timeout=2)
+        self.assertEqual(context.exception.code, 405)
+        self.assertEqual(context.exception.headers.get("Allow"), "POST, OPTIONS")
 
     def test_mcp_requires_bearer_token(self):
         with self.assertRaises(urllib.error.HTTPError) as context:

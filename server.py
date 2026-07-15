@@ -21,7 +21,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from http import HTTPStatus
 from typing import Any
 
@@ -47,7 +46,6 @@ MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
 OAUTH_SCOPE = "netease.read" if READ_ONLY else "netease.read netease.write"
-SESSION_ID = str(uuid.uuid4())
 USED_AUTHORIZATION_CODES: dict[str, int] = {}
 USED_CODES_LOCK = threading.Lock()
 FAILED_LOGINS: dict[str, list[int]] = {}
@@ -512,7 +510,7 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.2.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.3.0"},
             },
         }
     if method == "tools/list":
@@ -764,7 +762,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/3.2"
+    server_version = "NetEaseMusicMCP/3.3"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -784,7 +782,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Mcp-Session-Id", SESSION_ID)
         self.send_header("X-Content-Type-Options", "nosniff")
         if headers:
             for name, value in headers.items():
@@ -902,6 +899,16 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path.rstrip("/") or "/"
+        if path == "/mcp":
+            # This server is intentionally stateless and does not expose an SSE
+            # listener. Streamable HTTP permits a 405 response when GET streams
+            # are unsupported. Do not emit Mcp-Session-Id on POST responses.
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self._cors()
+            self.send_header("Allow", "POST, OPTIONS")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
         if path == "/health":
             self._json({"status": "ok", "mode": "read-only" if READ_ONLY else "read-write"})
             return

@@ -13,6 +13,7 @@ Cloud Music account. It is derived from
 - Public wildcard CORS is removed.
 - Inputs, request sizes and upstream responses are validated.
 - Upstream tool failures are returned as MCP error content so one failed action does not break the chat stream.
+- Streamable HTTP runs statelessly and does not advertise a session or SSE stream that the server cannot maintain.
 - Cookies are read only from environment variables and are never returned by `/health`.
 - Destructive tools are clearly identified and require `MCP_READ_ONLY=false`.
 
