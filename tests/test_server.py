@@ -53,6 +53,10 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(tools["like_song"]["annotations"]["destructiveHint"])
         self.assertFalse(tools["update_playlist"]["annotations"]["destructiveHint"])
         self.assertEqual(tools["update_playlist"]["inputSchema"]["minProperties"], 2)
+        self.assertTrue(tools["reorder_playlist_tracks"]["annotations"]["destructiveHint"])
+        playlist_schema = tools["get_playlist_songs"]["inputSchema"]["properties"]
+        self.assertEqual(playlist_schema["limit"]["default"], 50)
+        self.assertEqual(playlist_schema["offset"]["default"], 0)
 
     def test_write_mode_advertises_write_oauth_scope(self):
         module = load_server("false", oauth=True)
@@ -76,6 +80,183 @@ class ToolTests(unittest.TestCase):
             result = module.search_song("Home")
         self.assertIn("Home - Depeche Mode", result)
         self.assertIn("ID:123", result)
+
+    def test_get_playlist_songs_default_pagination(self):
+        module = load_server("true")
+        playlist = {
+            "playlist": {
+                "name": "Signals",
+                "trackCount": 3,
+                "trackIds": [{"id": 11}, {"id": 22}, {"id": 33}],
+            }
+        }
+        details = {
+            "code": 200,
+            "songs": [
+                {"id": 11, "name": "One", "ar": [{"id": 1, "name": "A"}]},
+                {"id": 22, "name": "Two", "ar": [{"id": 2, "name": "B"}]},
+                {"id": 33, "name": "Three", "ar": [{"id": 3, "name": "C"}]},
+            ],
+        }
+        with mock.patch.object(module, "netease_request", side_effect=[playlist, details]) as request:
+            payload = json.loads(
+                module.call_tool("get_playlist_songs", {"playlist_id": 99})
+            )
+        self.assertEqual(payload["pagination"]["limit"], 50)
+        self.assertEqual(payload["pagination"]["offset"], 0)
+        self.assertEqual(payload["pagination"]["returned"], 3)
+        self.assertEqual(payload["playlist"]["total_tracks"], 3)
+        self.assertFalse(payload["pagination"]["has_next"])
+        self.assertEqual([song["position"] for song in payload["songs"]], [1, 2, 3])
+        self.assertEqual(request.call_count, 2)
+
+    def test_get_playlist_songs_custom_limit_and_offset(self):
+        module = load_server("true")
+        playlist = {
+            "playlist": {
+                "name": "Paged",
+                "trackCount": 5,
+                "trackIds": [{"id": song_id} for song_id in [1, 2, 3, 4, 5]],
+            }
+        }
+        details = {
+            "code": 200,
+            "songs": [
+                {"id": 3, "name": "Three", "ar": []},
+                {"id": 4, "name": "Four", "ar": []},
+            ],
+        }
+        with mock.patch.object(module, "netease_request", side_effect=[playlist, details]) as request:
+            payload = json.loads(module.get_playlist_songs(99, limit=2, offset=2))
+        self.assertEqual([song["song_id"] for song in payload["songs"]], [3, 4])
+        self.assertTrue(payload["pagination"]["has_next"])
+        self.assertEqual(payload["pagination"]["next_offset"], 4)
+        requested = json.loads(request.call_args_list[1].kwargs["data"]["c"])
+        self.assertEqual(requested, [{"id": 3}, {"id": 4}])
+
+    def test_get_playlist_songs_rejects_invalid_pagination(self):
+        module = load_server("true")
+        invalid_calls = [
+            {"limit": 0},
+            {"limit": 101},
+            {"limit": True},
+            {"offset": -1},
+            {"offset": 1.5},
+            {"offset": False},
+        ]
+        with mock.patch.object(module, "netease_request") as request:
+            for kwargs in invalid_calls:
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    module.get_playlist_songs(99, **kwargs)
+        request.assert_not_called()
+
+    def test_get_playlist_songs_handles_empty_and_out_of_range_pages(self):
+        module = load_server("true")
+        empty = {"playlist": {"name": "Empty", "trackCount": 0, "trackIds": []}}
+        with mock.patch.object(module, "netease_request", return_value=empty) as request:
+            payload = json.loads(module.get_playlist_songs(99))
+        self.assertEqual(payload["songs"], [])
+        self.assertEqual(payload["playlist"]["total_tracks"], 0)
+        request.assert_called_once()
+
+        short = {
+            "playlist": {
+                "name": "Short",
+                "trackCount": 2,
+                "trackIds": [{"id": 1}, {"id": 2}],
+            }
+        }
+        with mock.patch.object(module, "netease_request", return_value=short) as request:
+            payload = json.loads(module.get_playlist_songs(99, offset=20))
+        self.assertEqual(payload["songs"], [])
+        self.assertEqual(payload["pagination"]["offset"], 20)
+        self.assertFalse(payload["pagination"]["has_next"])
+        request.assert_called_once()
+
+    def test_get_song_details_returns_metadata_and_missing_fields(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "songs": [
+                {
+                    "id": 1,
+                    "name": "Concert Cut",
+                    "ar": [{"id": 10, "name": "Artist"}],
+                    "al": {"id": 20, "name": "Album", "tns": ["Translated Album"]},
+                    "dt": 123456,
+                    "publishTime": 0,
+                    "alia": ["Alias"],
+                    "tns": ["Translated Song"],
+                    "tags": ["Live"],
+                    "originCoverType": 0,
+                    "version": 7,
+                },
+                {"id": 2, "name": "Sparse", "ar": []},
+            ],
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_song_details([1, 2, 3]))
+        full, sparse = payload["songs"]
+        self.assertEqual(full["album"]["name"], "Album")
+        self.assertEqual(full["duration_ms"], 123456)
+        self.assertEqual(full["release_time"], "1970-01-01T00:00:00Z")
+        self.assertTrue(full["version_flags"]["live"])
+        self.assertIsNone(full["version_flags"]["remix"])
+        self.assertEqual(full["version_detection"], "explicit_upstream_metadata_only; title_not_parsed")
+        self.assertIsNone(sparse["album"])
+        self.assertIsNone(sparse["release_time"])
+        self.assertEqual(payload["missing_song_ids"], [3])
+
+    def test_get_recent_plays_preserves_upstream_order_and_timestamps(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "data": {
+                "total": 2,
+                "list": [
+                    {
+                        "resourceId": "2",
+                        "playTime": 2000,
+                        "data": {"id": 2, "name": "Newer", "ar": [{"id": 1, "name": "A"}]},
+                        "multiTerminalInfo": {"osText": "Web"},
+                    },
+                    {
+                        "resourceId": "1",
+                        "playTime": 1000,
+                        "data": {"id": 1, "name": "Older", "ar": [{"id": 2, "name": "B"}]},
+                    },
+                ],
+            },
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_recent_plays(2))
+        self.assertEqual([event["song_id"] for event in payload["events"]], [2, 1])
+        self.assertEqual([event["play_time_ms"] for event in payload["events"]], [2000, 1000])
+        self.assertEqual(payload["events"][0]["played_at"], "1970-01-01T00:00:02Z")
+        self.assertEqual(payload["events"][0]["source_device"], "Web")
+
+    def test_get_recent_plays_does_not_fake_aggregate_data_as_events(self):
+        module = load_server("true")
+        response = {
+            "weekData": [
+                {"song": {"id": 1, "name": "Grouped", "ar": []}, "playCount": 7}
+            ]
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_recent_plays())
+        self.assertEqual(payload["record_type"], "aggregated_play_counts")
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["aggregated_tracks"][0]["play_count"], 7)
+        self.assertNotIn("played_at", payload["aggregated_tracks"][0])
+
+    def test_upstream_failure_is_redacted(self):
+        module = load_server("true")
+        response = {"code": 500, "message": "failed for " + module.NETEASE_COOKIE}
+        with mock.patch.object(module, "netease_request", return_value=response):
+            with self.assertRaises(module.NetEaseError) as context:
+                module.get_recent_plays()
+        self.assertNotIn("MUSIC_U=test", str(context.exception))
+        self.assertIn("[REDACTED]", str(context.exception))
 
     def test_song_ids_reject_string_input(self):
         module = load_server("false")
@@ -113,6 +294,60 @@ class ToolTests(unittest.TestCase):
             )
         self.assertEqual(result, "Updated playlist 123: description.")
         self.assertEqual(request.call_args.kwargs["data"], {"id": "123", "desc": ""})
+
+    def test_reorder_playlist_tracks_rejects_invalid_complete_orders(self):
+        module = load_server("false")
+        with self.assertRaises(ValueError):
+            module._validate_complete_track_order([1, 2, 3], [1, 1, 3])
+        with self.assertRaises(ValueError):
+            module._validate_complete_track_order([1, 2, 3], [1, 2])
+        with self.assertRaises(ValueError):
+            module._validate_complete_track_order([1, 2, 3], [1, 2, 4])
+
+    def test_reorder_playlist_tracks_rejects_collected_playlist(self):
+        module = load_server("false")
+        responses = [
+            {"account": {"id": 7}},
+            {
+                "playlist": {
+                    "creator": {"userId": 8},
+                    "trackCount": 2,
+                    "trackIds": [{"id": 1}, {"id": 2}],
+                }
+            },
+        ]
+        with mock.patch.object(module, "netease_request", side_effect=responses) as request:
+            with self.assertRaises(PermissionError):
+                module.reorder_playlist_tracks(99, [2, 1])
+        self.assertEqual(request.call_count, 2)
+
+    def test_reorder_playlist_tracks_verifies_applied_order(self):
+        module = load_server("false")
+        responses = [
+            {"account": {"id": 7}},
+            {
+                "playlist": {
+                    "creator": {"userId": 7},
+                    "trackCount": 3,
+                    "trackIds": [{"id": 1}, {"id": 2}, {"id": 3}],
+                }
+            },
+            {"code": 200},
+            {
+                "playlist": {
+                    "creator": {"userId": 7},
+                    "trackCount": 3,
+                    "trackIds": [{"id": 3}, {"id": 2}, {"id": 1}],
+                }
+            },
+        ]
+        with mock.patch.object(module, "netease_request", side_effect=responses) as request:
+            payload = json.loads(module.reorder_playlist_tracks(99, [3, 2, 1]))
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["verified"])
+        self.assertEqual(payload["playlist_id"], 99)
+        self.assertEqual(request.call_args_list[2].kwargs["data"]["op"], "update")
+        self.assertEqual(request.call_args_list[2].kwargs["data"]["trackIds"], "[3,2,1]")
 
 
 class HTTPTests(unittest.TestCase):
@@ -187,6 +422,29 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(body["id"], 27)
         self.assertTrue(body["result"]["isError"])
         self.assertIn("Temporary NetEase failure", body["result"]["content"][0]["text"])
+
+    def test_tool_failure_does_not_leak_credentials_to_response_or_log(self):
+        secret_message = "upstream echoed " + self.module.NETEASE_COOKIE
+        with self.assertLogs(self.module.LOG, level="WARNING") as logs:
+            with mock.patch.object(
+                self.module,
+                "netease_request",
+                side_effect=self.module.NetEaseError(secret_message),
+            ):
+                with self.post(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 28,
+                        "method": "tools/call",
+                        "params": {"name": "search_song", "arguments": {"query": "Home"}},
+                    },
+                    "a-secure-test-token-that-is-long",
+                ) as response:
+                    body = response.read().decode()
+        joined_logs = "\n".join(logs.output)
+        self.assertNotIn("MUSIC_U=test", body)
+        self.assertNotIn("MUSIC_U=test", joined_logs)
+        self.assertIn("[REDACTED]", body)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -307,6 +565,16 @@ class OAuthHTTPTests(unittest.TestCase):
         ) as response:
             refreshed = json.loads(response.read())
         self.assertIn("access_token", refreshed)
+        with self.post_json(
+            "/mcp",
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            refreshed["access_token"],
+        ) as response:
+            retried = json.loads(response.read())
+        self.assertEqual(
+            {tool["name"] for tool in retried["result"]["tools"]},
+            self.module.READ_TOOL_NAMES,
+        )
 
     def test_authorization_code_cannot_be_reused(self):
         client = self.register()

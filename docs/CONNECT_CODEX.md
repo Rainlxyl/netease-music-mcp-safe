@@ -34,6 +34,9 @@ If the server is later changed from read-only to write mode, refresh the app's t
 disconnect it, and reconnect it. Existing refresh tokens retain their original read-only scope and
 must not be silently upgraded. The new authorization page will explicitly request write access.
 
+Also refresh, disconnect, and reconnect after deploying new tools or changing their input schema;
+otherwise ChatGPT may continue using a cached tool list from the previous deployment.
+
 Hosted Work cannot read an environment variable from the user's computer, so do not add a static
 `Authorization` header to a plugin manifest. The bearer-token configuration above remains available
 for local Codex clients.

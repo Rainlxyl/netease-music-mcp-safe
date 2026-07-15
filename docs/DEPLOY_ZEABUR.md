@@ -44,7 +44,8 @@ Do not change `MCP_READ_ONLY` until search, playlists, history and daily recomme
 been tested. When write mode is later enabled, clients should prompt before every account-changing
 tool.
 
-To enable the five existing write tools, set `MCP_READ_ONLY=false`, redeploy, and then disconnect and
-reconnect the ChatGPT app to grant `netease.write`. Confirm that the authorization page lists the
-account changes before entering the private OAuth password. Do not approve write access if the page
-still describes the connection as read-only.
+To enable the six existing write tools, including full playlist-track reordering, set
+`MCP_READ_ONLY=false`, redeploy, refresh the app's action definitions, and then disconnect and
+reconnect the ChatGPT app to grant `netease.write` and reload the current tool schemas. Confirm that
+the authorization page lists the account changes before entering the private OAuth password. Do not
+approve write access if the page still describes the connection as read-only.

@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import Any
 
@@ -55,7 +56,9 @@ READ_TOOL_NAMES = {
     "search_song",
     "list_my_playlists",
     "get_playlist_songs",
+    "get_song_details",
     "get_play_history",
+    "get_recent_plays",
     "daily_recommend",
 }
 WRITE_TOOL_NAMES = {
@@ -63,6 +66,7 @@ WRITE_TOOL_NAMES = {
     "update_playlist",
     "add_to_playlist",
     "remove_from_playlist",
+    "reorder_playlist_tracks",
     "like_song",
 }
 
@@ -110,17 +114,40 @@ READ_TOOLS = [
     _tool("list_my_playlists", "List playlists owned or collected by the logged-in user."),
     _tool(
         "get_playlist_songs",
-        "List up to 50 songs in a playlist.",
-        {"playlist_id": {"type": "integer", "minimum": 1}},
+        "Read one page of playlist tracks. Returns pagination metadata and does not modify the account.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        },
         ["playlist_id"],
     ),
     _tool(
+        "get_song_details",
+        "Read metadata for one song ID or up to 50 song IDs. Version flags use explicit upstream metadata only; the title is never guessed.",
+        {
+            "song_id": {"type": "integer", "minimum": 1},
+            "song_ids": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "minItems": 1,
+                "maxItems": 50,
+            },
+        },
+        min_properties=1,
+    ),
+    _tool(
         "get_play_history",
-        "Get recent NetEase listening history.",
+        "Read NetEase's aggregated weekly or all-time play ranking. Counts are grouped by song and are not individual play events or timestamps.",
         {
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30},
             "all_time": {"type": "boolean", "default": False},
         },
+    ),
+    _tool(
+        "get_recent_plays",
+        "Read actual recent song play events in upstream order, including per-play timestamps when NetEase supplies them. The upstream endpoint supports only a limit, not time-range or offset pagination.",
+        {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}},
     ),
     _tool("daily_recommend", "Get today's personalized song recommendations."),
 ]
@@ -174,6 +201,22 @@ WRITE_TOOLS = [
                 "items": {"type": "integer", "minimum": 1},
                 "minItems": 1,
                 "maxItems": 50,
+            },
+        },
+        ["playlist_id", "song_ids"],
+        read_only=False,
+        destructive=True,
+    ),
+    _tool(
+        "reorder_playlist_tracks",
+        "Replace the track order of a playlist owned by the current user. Requires the complete existing set of unique song IDs in the desired order and modifies account data.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "song_ids": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "minItems": 1,
+                "maxItems": 10000,
             },
         },
         ["playlist_id", "song_ids"],
@@ -262,6 +305,225 @@ def _song_ids(value: Any) -> list[int]:
     return [_positive_int(item, "song_id") for item in value]
 
 
+def _bounded_int(value: Any, field: str, minimum: int, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        raise ValueError(f"{field} must be an integer between {minimum} and {maximum}.")
+    return value
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer.")
+    return value
+
+
+def _redact_secrets(message: Any) -> str:
+    text = str(message)
+    for secret in (NETEASE_COOKIE, ACCESS_TOKEN, OAUTH_PASSWORD):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    for cookie_name in ("MUSIC_U", "__csrf", "NMTID"):
+        marker = cookie_name + "="
+        start = text.find(marker)
+        while start >= 0:
+            value_start = start + len(marker)
+            end_candidates = [
+                position
+                for position in (text.find(";", value_start), text.find(" ", value_start))
+                if position >= 0
+            ]
+            value_end = min(end_candidates) if end_candidates else len(text)
+            text = text[:value_start] + "[REDACTED]" + text[value_end:]
+            start = text.find(marker, value_start + len("[REDACTED]"))
+    return text[:500]
+
+
+def _upstream_error(response: dict[str, Any], fallback: str) -> str:
+    message = response.get("message") or response.get("msg")
+    return _redact_secrets(message) if isinstance(message, str) and message.strip() else fallback
+
+
+def _raise_for_upstream_code(response: dict[str, Any], fallback: str) -> None:
+    code = response.get("code")
+    if code is not None and code != 200:
+        raise NetEaseError(_upstream_error(response, fallback))
+
+
+def _json_text(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _milliseconds_to_iso8601(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _playlist_detail(playlist_id: int) -> dict[str, Any]:
+    response = netease_request(
+        f"https://music.163.com/api/v6/playlist/detail?id={playlist_id}&n=100000&s=0"
+    )
+    _raise_for_upstream_code(response, "Playlist lookup failed.")
+    playlist = response.get("playlist")
+    if not isinstance(playlist, dict):
+        raise NetEaseError(f"Playlist {playlist_id} is unavailable.")
+    return playlist
+
+
+def _playlist_track_ids(playlist: dict[str, Any]) -> tuple[list[int], int]:
+    raw_track_ids = playlist.get("trackIds")
+    track_ids: list[int] = []
+    if isinstance(raw_track_ids, list):
+        for item in raw_track_ids:
+            value = item.get("id") if isinstance(item, dict) else item
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                track_ids.append(value)
+
+    tracks = playlist.get("tracks")
+    if not track_ids and isinstance(tracks, list):
+        track_ids = [
+            item["id"]
+            for item in tracks
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), int)
+            and not isinstance(item.get("id"), bool)
+            and item["id"] > 0
+        ]
+
+    raw_total = playlist.get("trackCount")
+    total = raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) else len(track_ids)
+    total = max(total, len(track_ids))
+    if total > len(track_ids):
+        raise NetEaseError(
+            "NetEase did not return the complete playlist track ID list; pagination or reordering cannot be performed safely."
+        )
+    return track_ids, total
+
+
+def _fetch_song_records(song_ids: list[int]) -> list[dict[str, Any]]:
+    if not song_ids:
+        return []
+    response = netease_request(
+        "https://music.163.com/api/v3/song/detail",
+        data={
+            "c": json.dumps(
+                [{"id": song_id} for song_id in song_ids], separators=(",", ":")
+            )
+        },
+    )
+    _raise_for_upstream_code(response, "Song detail lookup failed.")
+    songs = response.get("songs")
+    if not isinstance(songs, list):
+        return []
+    by_id = {
+        song.get("id"): song
+        for song in songs
+        if isinstance(song, dict) and isinstance(song.get("id"), int)
+    }
+    return [by_id[song_id] for song_id in song_ids if song_id in by_id]
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _explicit_version_labels(song: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for field in ("tags", "entertainmentTags", "awardTags"):
+        value = song.get(field)
+        if isinstance(value, str) and value.strip():
+            labels.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                label = item.get("name") if isinstance(item, dict) else item
+                if isinstance(label, str) and label.strip():
+                    labels.append(label.strip())
+    return list(dict.fromkeys(labels))
+
+
+def _song_summary(song: dict[str, Any]) -> dict[str, Any]:
+    artists = song.get("ar", song.get("artists", []))
+    if not isinstance(artists, list):
+        artists = []
+    return {
+        "song_id": song.get("id"),
+        "name": song.get("name"),
+        "artists": [
+            {"id": artist.get("id"), "name": artist.get("name")}
+            for artist in artists
+            if isinstance(artist, dict)
+        ],
+    }
+
+
+def _song_detail_payload(song: dict[str, Any]) -> dict[str, Any]:
+    summary = _song_summary(song)
+    album = song.get("al", song.get("album"))
+    if not isinstance(album, dict):
+        album = {}
+    duration_ms = song.get("dt", song.get("duration"))
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int):
+        duration_ms = None
+    publish_time_ms = song.get("publishTime")
+    if isinstance(publish_time_ms, bool) or not isinstance(publish_time_ms, int):
+        publish_time_ms = None
+    labels = _explicit_version_labels(song)
+    normalized_labels = " ".join(labels).casefold()
+    version_flags = {
+        "live": True if "live" in normalized_labels else None,
+        "remix": True if "remix" in normalized_labels else None,
+        "remastered": True if "remaster" in normalized_labels else None,
+        "cover": True if "cover" in normalized_labels else None,
+    }
+    summary.update(
+        {
+            "album": {
+                "id": album.get("id"),
+                "name": album.get("name"),
+                "translated_names": _string_list(album.get("tns")),
+            }
+            if album
+            else None,
+            "duration_ms": duration_ms,
+            "duration_seconds": round(duration_ms / 1000, 3) if duration_ms is not None else None,
+            "publish_time_ms": publish_time_ms,
+            "release_time": _milliseconds_to_iso8601(publish_time_ms),
+            "aliases": _string_list(song.get("alia", song.get("alias"))),
+            "translated_names": _string_list(song.get("tns")),
+            "version_labels": labels,
+            "version_flags": version_flags,
+            "version_detection": "explicit_upstream_metadata_only; title_not_parsed",
+            "upstream_version_metadata": {
+                "version": song.get("version", song.get("v")),
+                "song_type": song.get("t"),
+                "file_type": song.get("ftype"),
+                "mark": song.get("mark"),
+                "origin_cover_type": song.get("originCoverType"),
+                "origin_song": song.get("originSongSimpleData"),
+                "resource_state": song.get("resourceState"),
+            },
+            "disc_number": song.get("cd"),
+            "track_number": song.get("no"),
+            "mv_id": song.get("mv"),
+            "copyright": song.get("copyright"),
+            "fee": song.get("fee"),
+        }
+    )
+    return summary
+
+
 def search_song(query: Any, limit: Any = 5) -> str:
     if not isinstance(query, str) or not query.strip() or len(query) > 200:
         raise ValueError("query must be between 1 and 200 characters.")
@@ -302,28 +564,68 @@ def list_my_playlists() -> str:
     return "\n".join(lines)
 
 
-def get_playlist_songs(playlist_id: Any) -> str:
+def get_playlist_songs(playlist_id: Any, limit: Any = 50, offset: Any = 0) -> str:
     playlist_id = _positive_int(playlist_id, "playlist_id")
-    response = netease_request(
-        f"https://music.163.com/api/v6/playlist/detail?id={playlist_id}"
+    # The reverse-engineered upstream's playlist helper slices complete
+    # trackIds before requesting song details. Keep pages at 100 or fewer so
+    # the follow-up detail request and MCP result remain bounded.
+    limit = _bounded_int(limit, "limit", 1, 100)
+    offset = _non_negative_int(offset, "offset")
+    playlist = _playlist_detail(playlist_id)
+    track_ids, total = _playlist_track_ids(playlist)
+    page_ids = track_ids[offset : offset + limit]
+    tracks = _fetch_song_records(page_ids)
+    returned_ids = {
+        track.get("id") for track in tracks if isinstance(track.get("id"), int)
+    }
+    has_next = offset + len(page_ids) < total
+    payload = {
+        "record_type": "playlist_track_page",
+        "playlist": {
+            "playlist_id": playlist_id,
+            "name": playlist.get("name"),
+            "total_tracks": total,
+        },
+        "pagination": {
+            "returned": len(tracks),
+            "requested_track_ids": len(page_ids),
+            "limit": limit,
+            "offset": offset,
+            "has_next": has_next,
+            "next_offset": offset + len(page_ids) if has_next else None,
+        },
+        "songs": [
+            {"position": offset + index, **_song_summary(track)}
+            for index, track in enumerate(tracks, 1)
+        ],
+        "missing_song_ids": [song_id for song_id in page_ids if song_id not in returned_ids],
+    }
+    return _json_text(payload)
+
+
+def get_song_details(song_ids: Any) -> str:
+    if isinstance(song_ids, int) and not isinstance(song_ids, bool):
+        ids = [_positive_int(song_ids, "song_id")]
+    elif isinstance(song_ids, list):
+        if not 1 <= len(song_ids) <= 50:
+            raise ValueError("song_ids must contain between 1 and 50 IDs.")
+        ids = [_positive_int(song_id, "song_id") for song_id in song_ids]
+    else:
+        raise ValueError("Provide one positive song_id or a list of 1 to 50 song_ids.")
+    if len(set(ids)) != len(ids):
+        raise ValueError("song_ids must not contain duplicates.")
+    songs = _fetch_song_records(ids)
+    returned_ids = {
+        song.get("id") for song in songs if isinstance(song.get("id"), int)
+    }
+    return _json_text(
+        {
+            "record_type": "song_details",
+            "requested_song_ids": ids,
+            "songs": [_song_detail_payload(song) for song in songs],
+            "missing_song_ids": [song_id for song_id in ids if song_id not in returned_ids],
+        }
     )
-    playlist = response.get("playlist") or {}
-    tracks = playlist.get("tracks") or []
-    if not tracks and playlist.get("trackIds"):
-        ids = [item["id"] for item in playlist["trackIds"][:50] if "id" in item]
-        tracks = netease_request(
-            "https://music.163.com/api/song/detail?ids=" + urllib.parse.quote(json.dumps(ids))
-        ).get("songs", [])
-    if not tracks:
-        return f"Playlist {playlist_id} is empty or unavailable."
-    lines = [f"Playlist: {playlist.get('name', '')} ({len(tracks[:50])} shown)"]
-    for index, track in enumerate(tracks[:50], 1):
-        artists = track.get("ar", track.get("artists", [])) or []
-        artist_text = ", ".join(a.get("name", "") for a in artists)
-        lines.append(
-            f"{index}. {track.get('name', '')} - {artist_text} (ID:{track.get('id', '')})"
-        )
-    return "\n".join(lines)
 
 
 def get_play_history(limit: Any = 30, all_time: Any = False) -> str:
@@ -338,7 +640,7 @@ def get_play_history(limit: Any = 30, all_time: Any = False) -> str:
     records = response.get("allData" if all_time else "weekData") or []
     if not records:
         return "No play history found."
-    lines = ["Recent play history:"]
+    lines = ["Aggregated play history (not individual play events):"]
     for index, record in enumerate(records[:limit], 1):
         song = record.get("song") or {}
         artists = song.get("ar", song.get("artists", [])) or []
@@ -349,6 +651,89 @@ def get_play_history(limit: Any = 30, all_time: Any = False) -> str:
             f"(plays:{count}, ID:{song.get('id', '')})"
         )
     return "\n".join(lines)
+
+
+def _aggregated_play_payload(response: dict[str, Any], limit: int) -> dict[str, Any] | None:
+    records = response.get("weekData")
+    period = "week"
+    if not isinstance(records, list):
+        records = response.get("allData")
+        period = "all_time"
+    if not isinstance(records, list):
+        return None
+    aggregated = []
+    for record in records[:limit]:
+        if not isinstance(record, dict):
+            continue
+        song = record.get("song") if isinstance(record.get("song"), dict) else {}
+        aggregated.append(
+            {
+                **_song_summary(song),
+                "play_count": record.get("playCount"),
+                "score": record.get("score"),
+            }
+        )
+    return {
+        "record_type": "aggregated_play_counts",
+        "period": period,
+        "events": [],
+        "aggregated_tracks": aggregated,
+        "limitation": "The upstream response contains per-song aggregates and no per-play timestamps; it is not presented as a recent-play event stream.",
+    }
+
+
+def get_recent_plays(limit: Any = 100) -> str:
+    limit = _bounded_int(limit, "limit", 1, 100)
+    response = netease_request(
+        "https://music.163.com/api/play-record/song/list",
+        data={"limit": str(limit)},
+    )
+    _raise_for_upstream_code(response, "Recent play lookup failed.")
+    data = response.get("data")
+    entries = data.get("list") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        aggregate_payload = _aggregated_play_payload(response, limit)
+        if aggregate_payload is not None:
+            return _json_text(aggregate_payload)
+        entries = []
+
+    events = []
+    for entry in entries[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        song = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+        play_time_ms = entry.get("playTime")
+        terminal = entry.get("multiTerminalInfo")
+        if not isinstance(terminal, dict):
+            terminal = {}
+        events.append(
+            {
+                **_song_summary(song),
+                "song_id": song.get("id", entry.get("resourceId")),
+                "play_time_ms": play_time_ms
+                if isinstance(play_time_ms, int) and not isinstance(play_time_ms, bool)
+                else None,
+                "played_at": _milliseconds_to_iso8601(play_time_ms),
+                "source_device": terminal.get("osText"),
+                "banned": entry.get("banned") if isinstance(entry.get("banned"), bool) else None,
+            }
+        )
+    raw_total = data.get("total") if isinstance(data, dict) else None
+    return _json_text(
+        {
+            "record_type": "recent_play_events",
+            "order": "upstream_order_preserved",
+            "returned": len(events),
+            "upstream_total": raw_total if isinstance(raw_total, int) else None,
+            "limit": limit,
+            "events": events,
+            "limitations": {
+                "time_range_supported": False,
+                "offset_pagination_supported": False,
+                "completion_status_available": False,
+            },
+        }
+    )
 
 
 def daily_recommend() -> str:
@@ -384,7 +769,7 @@ def create_playlist(name: Any, description: Any = "", privacy: Any = 10) -> str:
         data={"name": name.strip(), "privacy": str(privacy), "type": "NORMAL", "description": description},
     )
     if response.get("code") != 200:
-        raise NetEaseError(response.get("message") or "Playlist creation failed.")
+        raise NetEaseError(_upstream_error(response, "Playlist creation failed."))
     playlist = response.get("playlist") or {}
     return f"Created playlist {name.strip()!r} (ID:{playlist.get('id', '')})."
 
@@ -399,7 +784,7 @@ def manipulate_playlist(operation: str, playlist_id: Any, song_ids: Any) -> str:
     if response.get("code") == 502 and operation == "add":
         return "One or more songs were already in the playlist."
     if response.get("code") != 200:
-        raise NetEaseError(response.get("message") or "Playlist update failed.")
+        raise NetEaseError(_upstream_error(response, "Playlist update failed."))
     verb = "Added" if operation == "add" else "Removed"
     return f"{verb} {len(ids)} song(s) {'to' if operation == 'add' else 'from'} playlist {playlist_id}."
 
@@ -431,7 +816,7 @@ def update_playlist(
             data={"id": str(playlist_id), "name": clean_name},
         )
         if response.get("code") != 200:
-            raise NetEaseError(response.get("message") or "Playlist name update failed.")
+            raise NetEaseError(_upstream_error(response, "Playlist name update failed."))
         updated.append("name")
 
     if description is not None:
@@ -440,7 +825,7 @@ def update_playlist(
             data={"id": str(playlist_id), "desc": description},
         )
         if response.get("code") != 200:
-            message = response.get("message") or "Playlist description update failed."
+            message = _upstream_error(response, "Playlist description update failed.")
             if updated:
                 raise NetEaseError(
                     f"Playlist name was updated, but the description was not: {message}"
@@ -449,6 +834,73 @@ def update_playlist(
         updated.append("description")
 
     return f"Updated playlist {playlist_id}: {', '.join(updated)}."
+
+
+def _validate_complete_track_order(current_ids: list[int], requested: Any) -> list[int]:
+    if not isinstance(requested, list) or not 1 <= len(requested) <= 10000:
+        raise ValueError("song_ids must contain the complete order of 1 to 10000 IDs.")
+    requested_ids = [_positive_int(song_id, "song_id") for song_id in requested]
+    if len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("song_ids must not contain duplicates.")
+    if len(set(current_ids)) != len(current_ids):
+        raise NetEaseError("The existing playlist contains duplicate IDs and cannot be reordered safely.")
+    if len(requested_ids) != len(current_ids) or set(requested_ids) != set(current_ids):
+        raise ValueError(
+            "song_ids must contain every existing playlist track exactly once; no tracks may be added, omitted, or replaced."
+        )
+    return requested_ids
+
+
+def reorder_playlist_tracks(playlist_id: Any, song_ids: Any) -> str:
+    playlist_id = _positive_int(playlist_id, "playlist_id")
+    uid = get_uid()
+    playlist = _playlist_detail(playlist_id)
+    creator = playlist.get("creator")
+    creator_id = creator.get("userId") if isinstance(creator, dict) else None
+    if creator_id is None or str(creator_id) != str(uid):
+        raise PermissionError("Only playlists owned by the current NetEase user can be reordered.")
+    current_ids, _ = _playlist_track_ids(playlist)
+    requested_ids = _validate_complete_track_order(current_ids, song_ids)
+    if requested_ids == current_ids:
+        return _json_text(
+            {
+                "success": True,
+                "changed": False,
+                "playlist_id": playlist_id,
+                "track_count": len(requested_ids),
+                "message": "The playlist is already in the requested order.",
+            }
+        )
+
+    response = netease_request(
+        "https://music.163.com/api/playlist/manipulate/tracks?csrf_token=" + get_csrf(),
+        data={
+            "pid": str(playlist_id),
+            "trackIds": json.dumps(requested_ids, separators=(",", ":")),
+            "op": "update",
+        },
+    )
+    _raise_for_upstream_code(response, "Playlist reorder failed.")
+
+    verified_playlist = _playlist_detail(playlist_id)
+    verified_ids, _ = _playlist_track_ids(verified_playlist)
+    if verified_ids != requested_ids:
+        raise NetEaseError(
+            "NetEase accepted the reorder request, but the returned playlist order did not match. No automatic retry was attempted."
+        )
+    return _json_text(
+        {
+            "success": True,
+            "changed": True,
+            "verified": True,
+            "playlist_id": playlist_id,
+            "track_count": len(verified_ids),
+            "order_summary": {
+                "first_song_ids": verified_ids[:5],
+                "last_song_ids": verified_ids[-5:],
+            },
+        }
+    )
 
 
 def like_song(song_id: Any, like: Any = True) -> str:
@@ -460,7 +912,7 @@ def like_song(song_id: Any, like: Any = True) -> str:
         f"&trackId={song_id}&like={'true' if like else 'false'}&time=25&csrf_token={get_csrf()}"
     )
     if response.get("code") != 200:
-        raise NetEaseError(response.get("message") or "Like operation failed.")
+        raise NetEaseError(_upstream_error(response, "Like operation failed."))
     return f"{'Liked' if like else 'Unliked'} song {song_id}."
 
 
@@ -476,9 +928,23 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
     if name == "list_my_playlists":
         return list_my_playlists()
     if name == "get_playlist_songs":
-        return get_playlist_songs(arguments.get("playlist_id"))
+        return get_playlist_songs(
+            arguments.get("playlist_id"),
+            arguments.get("limit", 50),
+            arguments.get("offset", 0),
+        )
+    if name == "get_song_details":
+        has_single = "song_id" in arguments
+        has_many = "song_ids" in arguments
+        if has_single == has_many:
+            raise ValueError("Provide exactly one of song_id or song_ids.")
+        return get_song_details(
+            arguments.get("song_id") if has_single else arguments.get("song_ids")
+        )
     if name == "get_play_history":
         return get_play_history(arguments.get("limit", 30), arguments.get("all_time", False))
+    if name == "get_recent_plays":
+        return get_recent_plays(arguments.get("limit", 100))
     if name == "daily_recommend":
         return daily_recommend()
     if name == "create_playlist":
@@ -495,6 +961,10 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         return manipulate_playlist("add", arguments.get("playlist_id"), arguments.get("song_ids"))
     if name == "remove_from_playlist":
         return manipulate_playlist("del", arguments.get("playlist_id"), arguments.get("song_ids"))
+    if name == "reorder_playlist_tracks":
+        return reorder_playlist_tracks(
+            arguments.get("playlist_id"), arguments.get("song_ids")
+        )
     if name == "like_song":
         return like_song(arguments.get("song_id"), arguments.get("like", True))
     raise ValueError(f"Unknown tool: {name}")
@@ -510,7 +980,7 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.3.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.4.0"},
             },
         }
     if method == "tools/list":
@@ -762,7 +1232,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/3.3"
+    server_version = "NetEaseMusicMCP/3.4"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -864,8 +1334,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
         access_text = (
             "Authorize access to read your NetEase music data and to create playlists, edit playlist "
-            "names or descriptions, add or remove playlist tracks, and like or unlike songs. ChatGPT "
-            "will still apply its confirmation settings before write actions."
+            "names or descriptions, add, remove, or reorder playlist tracks, and like or unlike songs. "
+            "ChatGPT will still apply its confirmation settings before write actions."
             if write_requested
             else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
         )
@@ -1053,15 +1523,16 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST,
                 )
         except NetEaseError as exc:
-            LOG.warning("NetEase operation failed: %s", exc)
+            safe_message = _redact_secrets(exc)
+            LOG.warning("NetEase operation failed: %s", safe_message)
             if tool_call:
-                self._json(tool_error_response(request_id, str(exc)))
+                self._json(tool_error_response(request_id, safe_message))
             else:
                 self._json(
                     {
                         "jsonrpc": "2.0",
                         "id": request_id,
-                        "error": {"code": -32001, "message": str(exc)},
+                        "error": {"code": -32001, "message": safe_message},
                     },
                     HTTPStatus.BAD_GATEWAY,
                 )
