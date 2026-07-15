@@ -18,12 +18,16 @@ import os
 import secrets
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import Any
+
+from image_safety import normalize_cover_image, validate_file_reference
+from persistence import PersistentStore, utc_now
 
 
 LOG = logging.getLogger("netease_music_mcp")
@@ -46,11 +50,26 @@ ALLOWED_ORIGIN = os.environ.get("MCP_ALLOWED_ORIGIN", "").strip()
 MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
+STORAGE_PATH = os.environ.get("MCP_STORAGE_PATH", "").strip()
+REQUIRE_WRITE_PREVIEW = os.environ.get("MCP_REQUIRE_WRITE_PREVIEW", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+PREVIEW_TTL_SECONDS = int(os.environ.get("MCP_PREVIEW_TTL_SECONDS", "300"))
+OPERATION_RETENTION_DAYS = int(os.environ.get("MCP_OPERATION_RETENTION_DAYS", "90"))
+MAX_OPERATION_LOGS = int(os.environ.get("MCP_MAX_OPERATION_LOGS", "1000"))
+MAX_PENDING_PREVIEWS = int(os.environ.get("MCP_MAX_PENDING_PREVIEWS", "200"))
+MAX_IMAGE_BYTES = int(os.environ.get("MCP_MAX_IMAGE_BYTES", "5242880"))
+MAX_IMAGE_PIXELS = int(os.environ.get("MCP_MAX_IMAGE_PIXELS", "25000000"))
 OAUTH_SCOPE = "netease.read" if READ_ONLY else "netease.read netease.write"
 USED_AUTHORIZATION_CODES: dict[str, int] = {}
 USED_CODES_LOCK = threading.Lock()
 FAILED_LOGINS: dict[str, list[int]] = {}
 FAILED_LOGINS_LOCK = threading.Lock()
+STORE_INSTANCE: PersistentStore | None = None
+STORE_LOCK = threading.Lock()
 
 READ_TOOL_NAMES = {
     "search_song",
@@ -60,6 +79,9 @@ READ_TOOL_NAMES = {
     "get_play_history",
     "get_recent_plays",
     "daily_recommend",
+    "preview_operation",
+    "get_operation_log",
+    "list_interaction_notes",
 }
 WRITE_TOOL_NAMES = {
     "create_playlist",
@@ -68,6 +90,11 @@ WRITE_TOOL_NAMES = {
     "remove_from_playlist",
     "reorder_playlist_tracks",
     "like_song",
+    "undo_operation",
+    "update_playlist_cover",
+    "create_interaction_note",
+    "update_interaction_note",
+    "delete_interaction_note",
 }
 
 
@@ -79,6 +106,7 @@ def _tool(
     read_only: bool = True,
     destructive: bool = False,
     min_properties: int | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -89,7 +117,7 @@ def _tool(
         schema["required"] = required
     if min_properties is not None:
         schema["minProperties"] = min_properties
-    return {
+    result = {
         "name": name,
         "description": description,
         "inputSchema": schema,
@@ -99,6 +127,9 @@ def _tool(
             "openWorldHint": True,
         },
     }
+    if meta:
+        result["_meta"] = meta
+    return result
 
 
 READ_TOOLS = [
@@ -150,6 +181,39 @@ READ_TOOLS = [
         {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}},
     ),
     _tool("daily_recommend", "Get today's personalized song recommendations."),
+    _tool(
+        "preview_operation",
+        "Read-only preview for an account or private-note write. It never changes data and returns a short-lived token bound to the arguments and current resource state.",
+        {
+            "operation": {"type": "string", "enum": sorted(WRITE_TOOL_NAMES)},
+            "arguments": {"type": "object", "additionalProperties": True},
+        },
+        ["operation", "arguments"],
+    ),
+    _tool(
+        "get_operation_log",
+        "Read sanitized, bounded operation audit records from persistent storage.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "operation": {"type": "string"},
+            "status": {"type": "string"},
+            "created_after": {"type": "string"},
+            "created_before": {"type": "string"},
+        },
+    ),
+    _tool(
+        "list_interaction_notes",
+        "Read private plugin-owned notes for an accessible playlist. These are not native NetEase comments.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "song_id": {"type": "integer", "minimum": 1},
+            "author": {"type": "string", "minLength": 1, "maxLength": 80},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        },
+        ["playlist_id"],
+    ),
 ]
 
 WRITE_TOOLS = [
@@ -160,6 +224,7 @@ WRITE_TOOLS = [
             "name": {"type": "string", "minLength": 1, "maxLength": 80},
             "description": {"type": "string", "maxLength": 1000},
             "privacy": {"type": "integer", "enum": [0, 10], "default": 10},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["name"],
         read_only=False,
@@ -171,6 +236,7 @@ WRITE_TOOLS = [
             "playlist_id": {"type": "integer", "minimum": 1},
             "name": {"type": "string", "minLength": 1, "maxLength": 80},
             "description": {"type": "string", "maxLength": 1000},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["playlist_id"],
         read_only=False,
@@ -187,6 +253,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 50,
             },
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -202,6 +269,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 50,
             },
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -218,6 +286,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 10000,
             },
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -229,8 +298,83 @@ WRITE_TOOLS = [
         {
             "song_id": {"type": "integer", "minimum": 1},
             "like": {"type": "boolean", "default": True},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
         },
         ["song_id"],
+        read_only=False,
+        destructive=True,
+    ),
+    _tool(
+        "undo_operation",
+        "Undo one successful reversible operation after verifying that its recorded after-state is still current. This modifies data and is itself logged.",
+        {
+            "operation_id": {"type": "string", "minLength": 1, "maxLength": 100},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+        },
+        ["operation_id", "preview_token"],
+        read_only=False,
+        destructive=True,
+    ),
+    _tool(
+        "update_playlist_cover",
+        "Replace an owned playlist cover with an uploaded PNG or JPEG. The image is validated, center-cropped, resized, stripped of metadata, and uploaded as JPEG. This is a destructive write and cannot be reliably undone.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "image": {
+                "type": "object",
+                "properties": {
+                    "download_url": {"type": "string", "format": "uri"},
+                    "file_id": {"type": "string"},
+                    "mime_type": {"type": "string", "enum": ["image/png", "image/jpeg"]},
+                    "file_name": {"type": "string"},
+                },
+                "required": ["download_url", "file_id"],
+                "additionalProperties": False,
+            },
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+        },
+        ["playlist_id", "image", "preview_token"],
+        read_only=False,
+        destructive=True,
+        meta={"openai/fileParams": ["image"]},
+    ),
+    _tool(
+        "create_interaction_note",
+        "Create a private plugin-owned playlist or track note in persistent storage. This does not create a native NetEase comment.",
+        {
+            "playlist_id": {"type": "integer", "minimum": 1},
+            "song_id": {"type": "integer", "minimum": 1},
+            "author": {"type": "string", "minLength": 1, "maxLength": 80},
+            "content": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "visibility": {"type": "string", "enum": ["private"], "default": "private"},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+        },
+        ["playlist_id", "author", "content", "preview_token"],
+        read_only=False,
+    ),
+    _tool(
+        "update_interaction_note",
+        "Update a private plugin-owned note using its current version for optimistic concurrency control.",
+        {
+            "note_id": {"type": "string", "minLength": 1, "maxLength": 100},
+            "version": {"type": "integer", "minimum": 1},
+            "author": {"type": "string", "minLength": 1, "maxLength": 80},
+            "content": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+        },
+        ["note_id", "version", "preview_token"],
+        read_only=False,
+        min_properties=4,
+    ),
+    _tool(
+        "delete_interaction_note",
+        "Soft-delete a private plugin-owned note using its current version. The deletion is reversible while the audit record is retained.",
+        {
+            "note_id": {"type": "string", "minLength": 1, "maxLength": 100},
+            "version": {"type": "integer", "minimum": 1},
+            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+        },
+        ["note_id", "version", "preview_token"],
         read_only=False,
         destructive=True,
     ),
@@ -273,6 +417,26 @@ def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[
         raise NetEaseError("NetEase could not be reached.") from None
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise NetEaseError("NetEase returned an unreadable response.") from None
+
+
+def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> dict[str, Any]:
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = response.read(1_000_000)
+    except urllib.error.HTTPError as exc:
+        raise NetEaseError(f"NetEase image upload failed with HTTP {exc.code}.") from None
+    except urllib.error.URLError:
+        raise NetEaseError("NetEase image storage could not be reached.") from None
+    if not payload:
+        return {"code": 200}
+    try:
+        result = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise NetEaseError("NetEase image storage returned an unreadable response.") from None
+    if not isinstance(result, dict):
+        raise NetEaseError("NetEase image storage returned an unexpected response.")
+    return result
 
 
 def get_csrf() -> str:
@@ -356,6 +520,74 @@ def _raise_for_upstream_code(response: dict[str, Any], fallback: str) -> None:
 
 def _json_text(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _state_hash(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _preview_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _store() -> PersistentStore:
+    global STORE_INSTANCE
+    if not STORAGE_PATH:
+        raise RuntimeError(
+            "Persistent storage is not configured. Set MCP_STORAGE_PATH to a SQLite file on a persistent volume."
+        )
+    if STORE_INSTANCE is None or STORE_INSTANCE.path != os.path.abspath(STORAGE_PATH):
+        with STORE_LOCK:
+            if STORE_INSTANCE is None or STORE_INSTANCE.path != os.path.abspath(STORAGE_PATH):
+                STORE_INSTANCE = PersistentStore(
+                    STORAGE_PATH,
+                    retention_days=OPERATION_RETENTION_DAYS,
+                    max_operations=MAX_OPERATION_LOGS,
+                    max_previews=MAX_PENDING_PREVIEWS,
+                )
+                STORE_INSTANCE.initialize()
+    return STORE_INSTANCE
+
+
+def _sanitize_value(value: Any, key: str = "") -> Any:
+    lowered = key.casefold()
+    sensitive_markers = (
+        "cookie",
+        "token",
+        "password",
+        "authorization",
+        "secret",
+        "download_url",
+        "environment",
+    )
+    if any(marker in lowered for marker in sensitive_markers):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(item_key): _sanitize_value(item_value, str(item_key)) for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    return value
+
+
+def _validate_iso8601(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError(f"{field} must be an ISO 8601 timestamp.")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(f"{field} must be an ISO 8601 timestamp.") from None
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include a timezone.")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _milliseconds_to_iso8601(value: Any) -> str | None:
@@ -916,6 +1148,900 @@ def like_song(song_id: Any, like: Any = True) -> str:
     return f"{'Liked' if like else 'Unliked'} song {song_id}."
 
 
+def _owned_playlist_state(playlist_id: int, kind: str) -> dict[str, Any]:
+    uid = get_uid()
+    playlist = _playlist_detail(playlist_id)
+    creator = playlist.get("creator")
+    creator_id = creator.get("userId") if isinstance(creator, dict) else None
+    if creator_id is None or str(creator_id) != str(uid):
+        raise PermissionError("Only playlists owned by the current NetEase user can be modified.")
+    state: dict[str, Any] = {"playlist_id": playlist_id, "creator_id": creator_id}
+    if kind == "metadata":
+        state.update({"name": playlist.get("name"), "description": playlist.get("description") or ""})
+    elif kind == "tracks":
+        state["track_ids"] = _playlist_track_ids(playlist)[0]
+    elif kind == "cover":
+        state.update(
+            {
+                "cover_image_id": playlist.get("coverImgId"),
+                "cover_image_url": playlist.get("coverImgUrl") if playlist.get("coverImgId") is None else None,
+            }
+        )
+    else:
+        raise ValueError("Unknown playlist state kind.")
+    return state
+
+
+def _liked_song_state(song_id: int) -> dict[str, Any]:
+    uid = get_uid()
+    response = netease_request(
+        "https://music.163.com/api/song/like/get",
+        data={"uid": str(uid)},
+    )
+    _raise_for_upstream_code(response, "Liked-song lookup failed.")
+    raw_ids = response.get("ids")
+    ids = raw_ids if isinstance(raw_ids, list) else []
+    return {"song_id": song_id, "liked": song_id in ids}
+
+
+def _accessible_playlist(playlist_id: int) -> tuple[int, dict[str, Any], list[int]]:
+    uid = get_uid()
+    playlist = _playlist_detail(playlist_id)
+    track_ids, _ = _playlist_track_ids(playlist)
+    return uid, playlist, track_ids
+
+
+def _note_snapshot(note: dict[str, Any] | None) -> dict[str, Any] | None:
+    if note is None:
+        return None
+    return {
+        "note_id": note.get("note_id"),
+        "playlist_id": note.get("playlist_id"),
+        "song_id": note.get("song_id"),
+        "author": note.get("author"),
+        "content": note.get("content"),
+        "visibility": note.get("visibility"),
+        "created_at": note.get("created_at"),
+        "updated_at": note.get("updated_at"),
+        "version": note.get("version"),
+        "deleted_at": note.get("deleted_at"),
+    }
+
+
+def _clean_note_id(value: Any, field: str = "note_id") -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 100:
+        raise ValueError(f"{field} must be a non-empty string up to 100 characters.")
+    return value
+
+
+def _clean_note_author(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 80:
+        raise ValueError("author must be between 1 and 80 characters.")
+    return value.strip()
+
+
+def _clean_note_content(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        raise ValueError("content must be between 1 and 2000 characters.")
+    return value.strip()
+
+
+def _normalize_write_arguments(operation: str, arguments: Any) -> dict[str, Any]:
+    if operation not in WRITE_TOOL_NAMES:
+        raise ValueError("operation must name an available write tool.")
+    if not isinstance(arguments, dict):
+        raise ValueError("arguments must be an object.")
+    arguments = {key: value for key, value in arguments.items() if key != "preview_token"}
+    if operation == "create_playlist":
+        name = arguments.get("name")
+        description = arguments.get("description", "")
+        privacy = arguments.get("privacy", 10)
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            raise ValueError("name must be between 1 and 80 characters.")
+        if not isinstance(description, str) or len(description) > 1000:
+            raise ValueError("description must be a string up to 1000 characters.")
+        if privacy not in (0, 10):
+            raise ValueError("privacy must be 0 (public) or 10 (private).")
+        return {"name": name.strip(), "description": description, "privacy": privacy}
+    if operation == "update_playlist":
+        playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
+        has_name = "name" in arguments
+        has_description = "description" in arguments
+        if not has_name and not has_description:
+            raise ValueError("At least one of name or description must be provided.")
+        normalized: dict[str, Any] = {"playlist_id": playlist_id}
+        if has_name:
+            name = arguments.get("name")
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+                raise ValueError("name must be between 1 and 80 characters.")
+            normalized["name"] = name.strip()
+        if has_description:
+            description = arguments.get("description")
+            if not isinstance(description, str) or len(description) > 1000:
+                raise ValueError("description must be a string up to 1000 characters.")
+            normalized["description"] = description
+        return normalized
+    if operation in {"add_to_playlist", "remove_from_playlist"}:
+        playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
+        ids = _song_ids(arguments.get("song_ids"))
+        if len(set(ids)) != len(ids):
+            raise ValueError("song_ids must not contain duplicates.")
+        return {"playlist_id": playlist_id, "song_ids": ids}
+    if operation == "reorder_playlist_tracks":
+        playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
+        requested = arguments.get("song_ids")
+        if not isinstance(requested, list) or not 1 <= len(requested) <= 10000:
+            raise ValueError("song_ids must contain the complete order of 1 to 10000 IDs.")
+        ids = [_positive_int(item, "song_id") for item in requested]
+        if len(set(ids)) != len(ids):
+            raise ValueError("song_ids must not contain duplicates.")
+        return {"playlist_id": playlist_id, "song_ids": ids}
+    if operation == "like_song":
+        song_id = _positive_int(arguments.get("song_id"), "song_id")
+        like = arguments.get("like", True)
+        if not isinstance(like, bool):
+            raise ValueError("like must be a boolean.")
+        return {"song_id": song_id, "like": like}
+    if operation == "update_playlist_cover":
+        playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
+        reference = validate_file_reference(arguments.get("image"))
+        return {
+            "playlist_id": playlist_id,
+            "image": {
+                "file_id": reference["file_id"],
+                "mime_type": reference["mime_type"],
+                "file_name": reference["file_name"],
+            },
+        }
+    if operation == "create_interaction_note":
+        playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
+        song_id = arguments.get("song_id")
+        if song_id is not None:
+            song_id = _positive_int(song_id, "song_id")
+        visibility = arguments.get("visibility", "private")
+        if visibility != "private":
+            raise ValueError("visibility currently supports only private.")
+        return {
+            "playlist_id": playlist_id,
+            "song_id": song_id,
+            "author": _clean_note_author(arguments.get("author")),
+            "content": _clean_note_content(arguments.get("content")),
+            "visibility": visibility,
+        }
+    if operation == "update_interaction_note":
+        note_id = _clean_note_id(arguments.get("note_id"))
+        version = _positive_int(arguments.get("version"), "version")
+        if "author" not in arguments and "content" not in arguments:
+            raise ValueError("At least one of author or content must be provided.")
+        normalized = {"note_id": note_id, "version": version}
+        if "author" in arguments:
+            normalized["author"] = _clean_note_author(arguments.get("author"))
+        if "content" in arguments:
+            normalized["content"] = _clean_note_content(arguments.get("content"))
+        return normalized
+    if operation == "delete_interaction_note":
+        return {
+            "note_id": _clean_note_id(arguments.get("note_id")),
+            "version": _positive_int(arguments.get("version"), "version"),
+        }
+    if operation == "undo_operation":
+        return {"operation_id": _clean_note_id(arguments.get("operation_id"), "operation_id")}
+    raise ValueError("Unsupported write operation.")
+
+
+def _current_state_for_operation(
+    operation: str, arguments: dict[str, Any], user_id: int
+) -> dict[str, Any] | None:
+    if operation == "create_playlist":
+        return None
+    if operation == "update_playlist":
+        return _owned_playlist_state(arguments["playlist_id"], "metadata")
+    if operation in {"add_to_playlist", "remove_from_playlist", "reorder_playlist_tracks"}:
+        return _owned_playlist_state(arguments["playlist_id"], "tracks")
+    if operation == "like_song":
+        return _liked_song_state(arguments["song_id"])
+    if operation == "update_playlist_cover":
+        return _owned_playlist_state(arguments["playlist_id"], "cover")
+    if operation == "create_interaction_note":
+        _, _, track_ids = _accessible_playlist(arguments["playlist_id"])
+        if arguments.get("song_id") is not None and arguments["song_id"] not in track_ids:
+            raise ValueError("song_id is not currently in the specified playlist.")
+        return None
+    if operation in {"update_interaction_note", "delete_interaction_note"}:
+        note = _store().get_note(arguments["note_id"], user_id, include_deleted=True)
+        if note is None or note.get("deleted_at") is not None:
+            raise ValueError("The note does not exist or is already deleted.")
+        if note.get("version") != arguments["version"]:
+            raise ValueError("The note version is stale; reload it before modifying it.")
+        _accessible_playlist(int(note["playlist_id"]))
+        return _note_snapshot(note)
+    if operation == "undo_operation":
+        original = _store().get_operation(arguments["operation_id"], user_id)
+        if original is None:
+            raise ValueError("The operation does not exist.")
+        if original.get("status") != "success" or not original.get("reversible"):
+            raise ValueError("Only successful operations marked reversible can be undone.")
+        if original.get("undo_status") != "not_requested":
+            raise ValueError("This operation has already been undone or an undo was attempted.")
+        return _current_state_for_logged_operation(original, user_id)
+    raise ValueError("Unsupported write operation.")
+
+
+def _current_state_for_logged_operation(record: dict[str, Any], user_id: int) -> dict[str, Any] | None:
+    operation = str(record["operation"])
+    arguments = record.get("sanitized_arguments") or {}
+    if operation == "create_interaction_note":
+        after = record.get("after") or {}
+        note = _store().get_note(str(after.get("note_id", "")), user_id, include_deleted=True)
+        return _note_snapshot(note)
+    if operation in {"update_interaction_note", "delete_interaction_note"}:
+        note = _store().get_note(str(arguments.get("note_id", "")), user_id, include_deleted=True)
+        return _note_snapshot(note)
+    return _current_state_for_operation(operation, arguments, user_id)
+
+
+def preview_operation(operation: Any, arguments: Any) -> str:
+    if READ_ONLY:
+        raise PermissionError("Write tools are disabled; previews are available in read-write mode.")
+    if not isinstance(operation, str):
+        raise ValueError("operation must be a string.")
+    normalized = _normalize_write_arguments(operation, arguments)
+    user_id = get_uid()
+    before_state = _current_state_for_operation(operation, normalized, user_id)
+    target: dict[str, Any]
+    expected_after: Any
+    reversible = False
+    risk_level = "medium"
+    artifact: bytes | None = None
+    artifact_meta: dict[str, Any] | None = None
+
+    if operation == "create_playlist":
+        target = {"resource_type": "playlist", "playlist_id": None}
+        expected_after = dict(normalized)
+    elif operation == "update_playlist":
+        target = {"resource_type": "playlist", "playlist_id": normalized["playlist_id"]}
+        expected_after = dict(before_state or {})
+        expected_after.update({key: value for key, value in normalized.items() if key in {"name", "description"}})
+        reversible = expected_after != before_state
+    elif operation == "add_to_playlist":
+        target = {"resource_type": "playlist_tracks", "playlist_id": normalized["playlist_id"]}
+        current_ids = list((before_state or {}).get("track_ids", []))
+        added_ids = [song_id for song_id in normalized["song_ids"] if song_id not in current_ids]
+        expected_after = {**(before_state or {}), "track_ids": current_ids + added_ids}
+        reversible = bool(added_ids)
+    elif operation == "remove_from_playlist":
+        target = {"resource_type": "playlist_tracks", "playlist_id": normalized["playlist_id"]}
+        current_ids = list((before_state or {}).get("track_ids", []))
+        missing = [song_id for song_id in normalized["song_ids"] if song_id not in current_ids]
+        if missing:
+            raise ValueError(f"Cannot remove song IDs that are not in the playlist: {missing}.")
+        expected_after = {
+            **(before_state or {}),
+            "track_ids": [song_id for song_id in current_ids if song_id not in normalized["song_ids"]],
+        }
+        reversible = expected_after != before_state
+        risk_level = "high"
+    elif operation == "reorder_playlist_tracks":
+        target = {"resource_type": "playlist_tracks", "playlist_id": normalized["playlist_id"]}
+        current_ids = list((before_state or {}).get("track_ids", []))
+        requested_ids = _validate_complete_track_order(current_ids, normalized["song_ids"])
+        expected_after = {**(before_state or {}), "track_ids": requested_ids}
+        reversible = expected_after != before_state
+        risk_level = "high"
+    elif operation == "like_song":
+        target = {"resource_type": "song_like", "song_id": normalized["song_id"]}
+        expected_after = {"song_id": normalized["song_id"], "liked": normalized["like"]}
+        reversible = expected_after != before_state
+        if normalized["like"] is False:
+            risk_level = "high"
+    elif operation == "update_playlist_cover":
+        target = {"resource_type": "playlist_cover", "playlist_id": normalized["playlist_id"]}
+        raw_reference = arguments.get("image") if isinstance(arguments, dict) else None
+        artifact, artifact_meta = normalize_cover_image(
+            raw_reference,
+            max_bytes=MAX_IMAGE_BYTES,
+            max_pixels=MAX_IMAGE_PIXELS,
+        )
+        expected_after = {
+            "playlist_id": normalized["playlist_id"],
+            "processed_image": artifact_meta,
+            "undo_limitation": "NetEase does not provide a reliable original-cover file for restoration.",
+        }
+        risk_level = "high"
+    elif operation == "create_interaction_note":
+        target = {
+            "resource_type": "interaction_note",
+            "playlist_id": normalized["playlist_id"],
+            "song_id": normalized.get("song_id"),
+        }
+        expected_after = {**normalized, "version": 1, "deleted_at": None}
+        reversible = True
+        risk_level = "low"
+    elif operation == "update_interaction_note":
+        target = {"resource_type": "interaction_note", "note_id": normalized["note_id"]}
+        expected_after = dict(before_state or {})
+        expected_after.update({key: value for key, value in normalized.items() if key in {"author", "content"}})
+        expected_after["version"] = normalized["version"] + 1
+        reversible = expected_after != before_state
+        risk_level = "low"
+    elif operation == "delete_interaction_note":
+        target = {"resource_type": "interaction_note", "note_id": normalized["note_id"]}
+        expected_after = {**(before_state or {}), "deleted_at": "set_on_execution", "version": normalized["version"] + 1}
+        reversible = True
+        risk_level = "high"
+    elif operation == "undo_operation":
+        original = _store().get_operation(normalized["operation_id"], user_id)
+        assert original is not None
+        if _canonical_json(before_state) != _canonical_json(original.get("after")):
+            raise ValueError("The resource changed after the recorded operation; undo is unsafe.")
+        target = {"resource_type": "operation", "operation_id": normalized["operation_id"]}
+        expected_after = original.get("before")
+        risk_level = "high"
+    else:
+        raise ValueError("Unsupported write operation.")
+
+    preview_token = secrets.token_urlsafe(32)
+    created_at = utc_now()
+    expires_at = time.time() + PREVIEW_TTL_SECONDS
+    sanitized_arguments = _sanitize_value(normalized)
+    _store().save_preview(
+        {
+            "token_hash": _preview_token_hash(preview_token),
+            "user_id": user_id,
+            "operation": operation,
+            "arguments": normalized,
+            "sanitized_arguments": sanitized_arguments,
+            "target": target,
+            "before_state": before_state,
+            "expected_after_state": expected_after,
+            "state_hash": _state_hash(before_state),
+            "risk_level": risk_level,
+            "reversible": reversible,
+            "artifact": artifact,
+            "artifact_meta": artifact_meta,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+    )
+    return _json_text(
+        {
+            "operation": operation,
+            "normalized_arguments": sanitized_arguments,
+            "target": target,
+            "before_state": before_state,
+            "expected_after_state": expected_after,
+            "risk_level": risk_level,
+            "reversible": reversible,
+            "preview_token": preview_token,
+            "created_at": created_at,
+            "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "expires_in_seconds": PREVIEW_TTL_SECONDS,
+        }
+    )
+
+
+def get_operation_log(
+    limit: Any = 50,
+    offset: Any = 0,
+    operation: Any = None,
+    status: Any = None,
+    created_after: Any = None,
+    created_before: Any = None,
+) -> str:
+    limit = _bounded_int(limit, "limit", 1, 100)
+    offset = _non_negative_int(offset, "offset")
+    if operation is not None and (not isinstance(operation, str) or operation not in WRITE_TOOL_NAMES):
+        raise ValueError("operation filter must name a write tool.")
+    allowed_statuses = {
+        "started",
+        "success",
+        "failed",
+        "partial_success",
+        "conflict",
+        "unknown",
+    }
+    if status is not None and (not isinstance(status, str) or status not in allowed_statuses):
+        raise ValueError("status filter is invalid.")
+    after = _validate_iso8601(created_after, "created_after")
+    before = _validate_iso8601(created_before, "created_before")
+    if after and before and after > before:
+        raise ValueError("created_after must not be later than created_before.")
+    user_id = get_uid()
+    records = _store().query_operations(
+        user_id,
+        limit=limit,
+        offset=offset,
+        operation=operation,
+        status=status,
+        created_after=after,
+        created_before=before,
+    )
+    public_records = []
+    for record in records:
+        public_records.append(
+            {
+                "operation_id": record.get("operation_id"),
+                "operation": record.get("operation"),
+                "sanitized_arguments": record.get("sanitized_arguments"),
+                "target": record.get("target"),
+                "created_at": record.get("created_at"),
+                "completed_at": record.get("completed_at"),
+                "status": record.get("status"),
+                "before_state": record.get("before"),
+                "after_state": record.get("after"),
+                "reversible": record.get("reversible"),
+                "undo_status": record.get("undo_status"),
+                "undo_operation_id": record.get("undo_operation_id"),
+                "error_summary": record.get("error_summary"),
+            }
+        )
+    return _json_text(
+        {
+            "storage": "persistent_sqlite",
+            "retention": {"days": OPERATION_RETENTION_DAYS, "maximum_records": MAX_OPERATION_LOGS},
+            "limit": limit,
+            "offset": offset,
+            "returned": len(public_records),
+            "operations": public_records,
+        }
+    )
+
+
+def list_interaction_notes(
+    playlist_id: Any,
+    song_id: Any = None,
+    author: Any = None,
+    limit: Any = 50,
+    offset: Any = 0,
+) -> str:
+    playlist_id = _positive_int(playlist_id, "playlist_id")
+    if song_id is not None:
+        song_id = _positive_int(song_id, "song_id")
+    if author is not None:
+        author = _clean_note_author(author)
+    limit = _bounded_int(limit, "limit", 1, 100)
+    offset = _non_negative_int(offset, "offset")
+    user_id, playlist, track_ids = _accessible_playlist(playlist_id)
+    notes = _store().list_notes(
+        user_id,
+        playlist_id,
+        song_id=song_id,
+        author=author,
+        limit=limit,
+        offset=offset,
+    )
+    requested_song_ids = list(
+        dict.fromkeys(int(note["song_id"]) for note in notes if note.get("song_id") is not None)
+    )
+    songs = _fetch_song_records(requested_song_ids)
+    songs_by_id = {song.get("id"): _song_summary(song) for song in songs}
+    output = []
+    for note in notes:
+        current_song = songs_by_id.get(note.get("song_id")) if note.get("song_id") else None
+        output.append(
+            {
+                **_note_snapshot(note),
+                "stale": note.get("song_id") is not None and note.get("song_id") not in track_ids,
+                "current_song": current_song,
+            }
+        )
+    return _json_text(
+        {
+            "storage": "plugin_owned_private_sqlite",
+            "native_netease_data": False,
+            "playlist": {"playlist_id": playlist_id, "name": playlist.get("name")},
+            "limit": limit,
+            "offset": offset,
+            "returned": len(output),
+            "notes": output,
+        }
+    )
+
+
+def _upload_playlist_cover(
+    playlist_id: int, image_bytes: bytes, image_meta: dict[str, Any]
+) -> dict[str, Any]:
+    allocation = netease_request(
+        "https://music.163.com/api/nos/token/alloc",
+        data={
+            "bucket": "yyimgs",
+            "ext": "jpg",
+            "filename": f"playlist-{playlist_id}.jpg",
+            "local": "false",
+            "nos_product": "0",
+            "return_body": '{"code":200,"size":"$(ObjectSize)"}',
+            "type": "other",
+        },
+    )
+    _raise_for_upstream_code(allocation, "NetEase image-upload allocation failed.")
+    allocation_result = allocation.get("result")
+    if not isinstance(allocation_result, dict):
+        raise NetEaseError("NetEase did not return image-upload credentials.")
+    object_key = allocation_result.get("objectKey")
+    upload_token = allocation_result.get("token")
+    image_id = allocation_result.get("docId")
+    if not all(isinstance(value, (str, int)) and str(value) for value in (object_key, upload_token, image_id)):
+        raise NetEaseError("NetEase returned incomplete image-upload credentials.")
+    encoded_key = urllib.parse.quote(str(object_key), safe="/")
+    upload_response = netease_binary_request(
+        f"https://nosup-hz1.127.net/yyimgs/{encoded_key}?offset=0&complete=true&version=1.0",
+        image_bytes,
+        {"x-nos-token": str(upload_token), "Content-Type": "image/jpeg"},
+    )
+    if upload_response.get("code") not in (None, 200):
+        raise NetEaseError("NetEase image storage rejected the cover upload.")
+    update_response = netease_request(
+        "https://music.163.com/api/playlist/cover/update?csrf_token=" + get_csrf(),
+        data={"id": str(playlist_id), "coverImgId": str(image_id)},
+    )
+    _raise_for_upstream_code(update_response, "Playlist cover update failed.")
+    return {
+        "success": True,
+        "playlist_id": playlist_id,
+        "upstream_image_id": image_id,
+        "final_format": image_meta.get("final_format"),
+        "final_mime_type": image_meta.get("final_mime_type"),
+        "final_width": image_meta.get("final_width"),
+        "final_height": image_meta.get("final_height"),
+        "metadata_removed": True,
+        "reversible": False,
+        "undo_limitation": "The original NetEase cover file cannot be recovered reliably.",
+    }
+
+
+def _execute_operation_action(
+    operation: str,
+    arguments: dict[str, Any],
+    preview: dict[str, Any],
+    user_id: int,
+    operation_id: str,
+) -> dict[str, Any]:
+    if operation == "create_playlist":
+        response = netease_request(
+            "https://music.163.com/api/playlist/create?csrf_token=" + get_csrf(),
+            data={
+                "name": arguments["name"],
+                "privacy": str(arguments["privacy"]),
+                "type": "NORMAL",
+                "description": arguments["description"],
+            },
+        )
+        _raise_for_upstream_code(response, "Playlist creation failed.")
+        playlist = response.get("playlist") if isinstance(response.get("playlist"), dict) else {}
+        return {
+            "success": True,
+            "playlist_id": playlist.get("id"),
+            "name": playlist.get("name", arguments["name"]),
+            "description": playlist.get("description", arguments["description"]),
+            "privacy": arguments["privacy"],
+        }
+    if operation == "update_playlist":
+        message = update_playlist(
+            arguments["playlist_id"],
+            arguments.get("name"),
+            arguments.get("description"),
+        )
+        return {"success": True, "message": message}
+    if operation == "add_to_playlist":
+        before_ids = list((preview.get("before") or {}).get("track_ids", []))
+        actual_ids = [song_id for song_id in arguments["song_ids"] if song_id not in before_ids]
+        if not actual_ids:
+            return {"success": True, "changed": False, "message": "All songs were already present."}
+        message = manipulate_playlist("add", arguments["playlist_id"], actual_ids)
+        return {"success": True, "changed": True, "song_ids": actual_ids, "message": message}
+    if operation == "remove_from_playlist":
+        message = manipulate_playlist("del", arguments["playlist_id"], arguments["song_ids"])
+        return {"success": True, "changed": True, "song_ids": arguments["song_ids"], "message": message}
+    if operation == "reorder_playlist_tracks":
+        return json.loads(reorder_playlist_tracks(arguments["playlist_id"], arguments["song_ids"]))
+    if operation == "like_song":
+        message = like_song(arguments["song_id"], arguments["like"])
+        return {"success": True, "message": message}
+    if operation == "update_playlist_cover":
+        artifact = preview.get("artifact")
+        image_meta = preview.get("artifact_meta")
+        if not isinstance(artifact, bytes) or not isinstance(image_meta, dict):
+            raise ValueError("The preview no longer contains the processed image; create a new preview.")
+        return _upload_playlist_cover(arguments["playlist_id"], artifact, image_meta)
+    if operation == "create_interaction_note":
+        note = _store().create_note(
+            {
+                "note_id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "playlist_id": arguments["playlist_id"],
+                "song_id": arguments.get("song_id"),
+                "author": arguments["author"],
+                "content": arguments["content"],
+                "visibility": arguments["visibility"],
+                "created_at": utc_now(),
+            }
+        )
+        return {"success": True, "note": _note_snapshot(note)}
+    if operation == "update_interaction_note":
+        note = _store().update_note(
+            arguments["note_id"],
+            user_id,
+            arguments["version"],
+            author=arguments.get("author"),
+            content=arguments.get("content"),
+        )
+        return {"success": True, "note": _note_snapshot(note)}
+    if operation == "delete_interaction_note":
+        note = _store().soft_delete_note(
+            arguments["note_id"], user_id, arguments["version"]
+        )
+        return {"success": True, "soft_deleted": True, "note": _note_snapshot(note)}
+    if operation == "undo_operation":
+        return _perform_undo(arguments["operation_id"], user_id, operation_id)
+    raise ValueError("Unsupported write operation.")
+
+
+def _undo_states_match(expected: Any, actual: Any, operation: str) -> bool:
+    if operation not in {
+        "create_interaction_note",
+        "update_interaction_note",
+        "delete_interaction_note",
+    }:
+        return _canonical_json(expected) == _canonical_json(actual)
+    fields = ("note_id", "playlist_id", "song_id", "author", "content", "visibility", "deleted_at")
+    return all((expected or {}).get(field) == (actual or {}).get(field) for field in fields)
+
+
+def _perform_undo(operation_to_undo: str, user_id: int, undo_operation_id: str) -> dict[str, Any]:
+    original = _store().get_operation(operation_to_undo, user_id)
+    if original is None:
+        raise ValueError("The operation does not exist.")
+    if original.get("status") != "success" or not original.get("reversible"):
+        raise ValueError("Only successful operations marked reversible can be undone.")
+    if original.get("undo_status") != "not_requested":
+        raise ValueError("This operation has already been undone or an undo was attempted.")
+    current = _current_state_for_logged_operation(original, user_id)
+    if _canonical_json(current) != _canonical_json(original.get("after")):
+        raise ValueError("The resource changed after the original operation; undo is unsafe.")
+    _store().set_undo_status(operation_to_undo, "in_progress", undo_operation_id)
+    operation = str(original["operation"])
+    before = original.get("before") or {}
+    after = original.get("after") or {}
+    arguments = original.get("sanitized_arguments") or {}
+    try:
+        if operation == "update_playlist":
+            update_playlist(
+                int(before["playlist_id"]),
+                before.get("name"),
+                before.get("description", ""),
+            )
+        elif operation == "add_to_playlist":
+            before_ids = list(before.get("track_ids", []))
+            added_ids = [song_id for song_id in after.get("track_ids", []) if song_id not in before_ids]
+            if added_ids:
+                manipulate_playlist("del", int(before["playlist_id"]), added_ids)
+        elif operation == "remove_from_playlist":
+            after_ids = list(after.get("track_ids", []))
+            removed_ids = [song_id for song_id in before.get("track_ids", []) if song_id not in after_ids]
+            if removed_ids:
+                manipulate_playlist("add", int(before["playlist_id"]), removed_ids)
+                reorder_playlist_tracks(int(before["playlist_id"]), list(before["track_ids"]))
+        elif operation == "reorder_playlist_tracks":
+            reorder_playlist_tracks(int(before["playlist_id"]), list(before["track_ids"]))
+        elif operation == "like_song":
+            like_song(int(before["song_id"]), bool(before["liked"]))
+        elif operation == "create_interaction_note":
+            note_id = str(after["note_id"])
+            current_note = _store().get_note(note_id, user_id, include_deleted=True)
+            if current_note is None:
+                raise ValueError("The created note no longer exists.")
+            _store().soft_delete_note(note_id, user_id, int(current_note["version"]))
+        elif operation in {"update_interaction_note", "delete_interaction_note"}:
+            note_id = str(arguments["note_id"])
+            current_note = _store().get_note(note_id, user_id, include_deleted=True)
+            if current_note is None:
+                raise ValueError("The note no longer exists.")
+            _store().restore_note_snapshot(before, user_id, int(current_note["version"]))
+        else:
+            raise ValueError("This operation does not have a safe undo implementation.")
+        restored = _current_state_for_logged_operation(original, user_id)
+        if not _undo_states_match(before, restored, operation):
+            raise NetEaseError("The undo request completed, but the restored state did not match the audit record.")
+    except Exception:
+        _store().set_undo_status(operation_to_undo, "failed", undo_operation_id)
+        raise
+    _store().set_undo_status(operation_to_undo, "succeeded", undo_operation_id)
+    return {
+        "success": True,
+        "undone_operation_id": operation_to_undo,
+        "original_operation": operation,
+        "before_undo": current,
+        "after_undo": restored,
+    }
+
+
+def _after_state_for_operation(
+    operation: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any] | None,
+    user_id: int,
+) -> Any:
+    if operation == "create_playlist":
+        return result
+    if operation in {"create_interaction_note", "update_interaction_note", "delete_interaction_note"}:
+        return (result or {}).get("note")
+    if operation == "undo_operation":
+        return (result or {}).get("after_undo")
+    return _current_state_for_operation(operation, arguments, user_id)
+
+
+def _best_effort_after_state(
+    operation: str, arguments: dict[str, Any], user_id: int
+) -> Any:
+    try:
+        if operation == "create_interaction_note":
+            return None
+        if operation in {"update_interaction_note", "delete_interaction_note"}:
+            return _note_snapshot(
+                _store().get_note(arguments["note_id"], user_id, include_deleted=True)
+            )
+        if operation == "undo_operation":
+            original = _store().get_operation(arguments["operation_id"], user_id)
+            return _current_state_for_logged_operation(original, user_id) if original else None
+        return _current_state_for_operation(operation, arguments, user_id)
+    except Exception:
+        return None
+
+
+def _execute_previewed_operation(
+    operation: str, raw_arguments: dict[str, Any], preview_token: Any
+) -> str:
+    if not isinstance(preview_token, str) or not 20 <= len(preview_token) <= 200:
+        raise ValueError("A valid preview_token is required. Call preview_operation first.")
+    normalized = _normalize_write_arguments(operation, raw_arguments)
+    user_id = get_uid()
+    token_hash = _preview_token_hash(preview_token)
+    claim_status, preview = _store().claim_preview(
+        token_hash, user_id, operation, normalized
+    )
+    if claim_status == "consumed":
+        result = preview.get("result") or {}
+        if result.get("status") != "success":
+            raise NetEaseError(result.get("error_summary") or "The previous execution attempt failed.")
+        result["idempotent_replay"] = True
+        return _json_text(result)
+
+    operation_id = str(uuid.uuid4())
+    _store().start_operation(
+        {
+            "operation_id": operation_id,
+            "user_id": user_id,
+            "operation": operation,
+            "sanitized_arguments": preview.get("sanitized_arguments"),
+            "target": preview.get("target"),
+            "created_at": utc_now(),
+            "before_state": preview.get("before"),
+            "reversible": preview.get("reversible"),
+            "parent_operation_id": normalized.get("operation_id") if operation == "undo_operation" else None,
+        }
+    )
+    try:
+        try:
+            current_state = _current_state_for_operation(operation, normalized, user_id)
+        except (ValueError, PermissionError) as exc:
+            error = _redact_secrets(exc)
+            conflict_result = {
+                "operation_id": operation_id,
+                "operation": operation,
+                "status": "conflict",
+                "error_summary": error,
+            }
+            _store().finish_operation(
+                operation_id,
+                status="conflict",
+                after_state=_best_effort_after_state(operation, normalized, user_id),
+                result=conflict_result,
+                error_summary=error,
+            )
+            _store().finish_preview(
+                token_hash, "conflict", operation_id=operation_id, result=conflict_result
+            )
+            if isinstance(exc, PermissionError):
+                raise PermissionError(error) from None
+            raise ValueError(error) from None
+        if _state_hash(current_state) != preview.get("state_hash"):
+            error = "The resource changed after preview; no write was performed. Create a new preview."
+            conflict_result = {
+                "operation_id": operation_id,
+                "operation": operation,
+                "status": "conflict",
+                "error_summary": error,
+            }
+            _store().finish_operation(
+                operation_id,
+                status="conflict",
+                after_state=current_state,
+                result=conflict_result,
+                error_summary=error,
+            )
+            _store().finish_preview(
+                token_hash, "conflict", operation_id=operation_id, result=conflict_result
+            )
+            raise ValueError(error)
+        action_result = _execute_operation_action(
+            operation, normalized, preview, user_id, operation_id
+        )
+        after_state = _after_state_for_operation(operation, normalized, action_result, user_id)
+        deterministic_operations = {
+            "update_playlist",
+            "add_to_playlist",
+            "remove_from_playlist",
+            "reorder_playlist_tracks",
+            "like_song",
+        }
+        if operation in deterministic_operations and _canonical_json(after_state) != _canonical_json(
+            preview.get("expected_after")
+        ):
+            raise NetEaseError(
+                "NetEase accepted the write, but the resulting state did not match the preview. No automatic retry was attempted."
+            )
+        if operation == "update_playlist_cover":
+            expected_image_id = action_result.get("upstream_image_id")
+            actual_image_id = (after_state or {}).get("cover_image_id")
+            if actual_image_id is not None and str(actual_image_id) != str(expected_image_id):
+                raise NetEaseError(
+                    "NetEase accepted the cover update, but the playlist still reports a different cover image."
+                )
+            action_result["verified"] = actual_image_id is not None
+        final_result = {
+            "operation_id": operation_id,
+            "operation": operation,
+            "status": "success",
+            "result": action_result,
+            "before_state": preview.get("before"),
+            "after_state": after_state,
+            "reversible": bool(preview.get("reversible")),
+        }
+        _store().finish_operation(
+            operation_id,
+            status="success",
+            after_state=after_state,
+            result=final_result,
+        )
+        _store().finish_preview(
+            token_hash, "consumed", operation_id=operation_id, result=final_result
+        )
+        return _json_text(final_result)
+    except Exception as exc:
+        existing = _store().get_operation(operation_id, user_id)
+        if existing and existing.get("status") in {"conflict", "success"}:
+            raise
+        safe_error = _redact_secrets(exc)
+        after_state = _best_effort_after_state(operation, normalized, user_id)
+        status = (
+            "partial_success"
+            if after_state is not None
+            and _canonical_json(after_state) != _canonical_json(preview.get("before"))
+            else "failed"
+        )
+        failure_result = {
+            "operation_id": operation_id,
+            "operation": operation,
+            "status": status,
+            "error_summary": safe_error,
+        }
+        _store().finish_operation(
+            operation_id,
+            status=status,
+            after_state=after_state,
+            result=failure_result,
+            error_summary=safe_error,
+        )
+        _store().finish_preview(
+            token_hash, "consumed", operation_id=operation_id, result=failure_result
+        )
+        if isinstance(exc, PermissionError):
+            raise PermissionError(safe_error) from None
+        if isinstance(exc, ValueError):
+            raise ValueError(safe_error) from None
+        raise NetEaseError(safe_error) from None
+
+
 def available_tools() -> list[dict[str, Any]]:
     return READ_TOOLS if READ_ONLY else READ_TOOLS + WRITE_TOOLS
 
@@ -923,6 +2049,21 @@ def available_tools() -> list[dict[str, Any]]:
 def call_tool(name: str, arguments: dict[str, Any]) -> str:
     if name in WRITE_TOOL_NAMES and READ_ONLY:
         raise PermissionError("Write tools are disabled. Set MCP_READ_ONLY=false to enable them.")
+    if name in WRITE_TOOL_NAMES:
+        preview_token = arguments.get("preview_token")
+        preview_only_tools = {
+            "undo_operation",
+            "update_playlist_cover",
+            "create_interaction_note",
+            "update_interaction_note",
+            "delete_interaction_note",
+        }
+        if preview_token is not None:
+            return _execute_previewed_operation(name, arguments, preview_token)
+        if REQUIRE_WRITE_PREVIEW or name in preview_only_tools:
+            raise ValueError(
+                "This write requires a matching preview_token. Call preview_operation with the same operation and arguments first."
+            )
     if name == "search_song":
         return search_song(arguments.get("query"), arguments.get("limit", 5))
     if name == "list_my_playlists":
@@ -947,6 +2088,25 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         return get_recent_plays(arguments.get("limit", 100))
     if name == "daily_recommend":
         return daily_recommend()
+    if name == "preview_operation":
+        return preview_operation(arguments.get("operation"), arguments.get("arguments"))
+    if name == "get_operation_log":
+        return get_operation_log(
+            arguments.get("limit", 50),
+            arguments.get("offset", 0),
+            arguments.get("operation"),
+            arguments.get("status"),
+            arguments.get("created_after"),
+            arguments.get("created_before"),
+        )
+    if name == "list_interaction_notes":
+        return list_interaction_notes(
+            arguments.get("playlist_id"),
+            arguments.get("song_id"),
+            arguments.get("author"),
+            arguments.get("limit", 50),
+            arguments.get("offset", 0),
+        )
     if name == "create_playlist":
         return create_playlist(
             arguments.get("name"), arguments.get("description", ""), arguments.get("privacy", 10)
@@ -980,7 +2140,13 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "3.4.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "4.0.0"},
+                "instructions": (
+                    "Before every write, call preview_operation with the target tool name and arguments, "
+                    "review its before/after states, then call that same write tool with the returned preview_token. "
+                    "Never reuse a preview for different arguments. Interaction notes are private plugin-owned data, "
+                    "not native NetEase comments."
+                ),
             },
         }
     if method == "tools/list":
@@ -1232,7 +2398,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/3.4"
+    server_version = "NetEaseMusicMCP/4.0"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -1334,7 +2500,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
         access_text = (
             "Authorize access to read your NetEase music data and to create playlists, edit playlist "
-            "names or descriptions, add, remove, or reorder playlist tracks, and like or unlike songs. "
+            "names, descriptions, or covers; add, remove, or reorder playlist tracks; like or unlike songs; "
+            "and manage private plugin-owned notes. Writes require a short-lived matching preview. "
             "ChatGPT will still apply its confirmation settings before write actions."
             if write_requested
             else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
@@ -1560,6 +2727,22 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_ACCESS_TOKEN before starting.")
     if MAX_REQUEST_BYTES < 1024:
         raise SystemExit("MCP_MAX_REQUEST_BYTES must be at least 1024.")
+    if not READ_ONLY and not STORAGE_PATH:
+        raise SystemExit(
+            "MCP_STORAGE_PATH is required in read-write mode. Point it to a SQLite file on a persistent volume."
+        )
+    if not 30 <= PREVIEW_TTL_SECONDS <= 3600:
+        raise SystemExit("MCP_PREVIEW_TTL_SECONDS must be between 30 and 3600.")
+    if not 1 <= OPERATION_RETENTION_DAYS <= 3650:
+        raise SystemExit("MCP_OPERATION_RETENTION_DAYS must be between 1 and 3650.")
+    if not 100 <= MAX_OPERATION_LOGS <= 100000:
+        raise SystemExit("MCP_MAX_OPERATION_LOGS must be between 100 and 100000.")
+    if not 10 <= MAX_PENDING_PREVIEWS <= 10000:
+        raise SystemExit("MCP_MAX_PENDING_PREVIEWS must be between 10 and 10000.")
+    if not 1_048_576 <= MAX_IMAGE_BYTES <= 20_971_520:
+        raise SystemExit("MCP_MAX_IMAGE_BYTES must be between 1 MiB and 20 MiB.")
+    if not 1_000_000 <= MAX_IMAGE_PIXELS <= 100_000_000:
+        raise SystemExit("MCP_MAX_IMAGE_PIXELS must be between 1 and 100 million.")
     if bool(PUBLIC_URL) != bool(OAUTH_PASSWORD):
         raise SystemExit("Set both MCP_PUBLIC_URL and MCP_OAUTH_PASSWORD, or neither.")
     if PUBLIC_URL and not PUBLIC_URL.startswith("https://"):

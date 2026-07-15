@@ -1,2 +1,2 @@
-# No third-party runtime dependencies.
+Pillow>=11.0,<13.0
 

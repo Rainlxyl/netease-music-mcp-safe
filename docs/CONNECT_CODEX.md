@@ -37,6 +37,11 @@ must not be silently upgraded. The new authorization page will explicitly reques
 Also refresh, disconnect, and reconnect after deploying new tools or changing their input schema;
 otherwise ChatGPT may continue using a cached tool list from the previous deployment.
 
+For writes, ChatGPT should first call `preview_operation`, present the proposed before/after state,
+and call the selected write tool with the returned `preview_token`. Cover uploads use ChatGPT's
+top-level file parameter support; attach a PNG or JPEG instead of providing an image URL. If the new
+file field or preview tools do not appear, refresh the action definitions and reconnect again.
+
 Hosted Work cannot read an environment variable from the user's computer, so do not add a static
 `Authorization` header to a plugin manifest. The bearer-token configuration above remains available
 for local Codex clients.

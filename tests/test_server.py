@@ -1,8 +1,11 @@
 import importlib.util
 import base64
 import hashlib
+import io
 import json
 import os
+import sqlite3
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -10,6 +13,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest import mock
+
+from PIL import Image
+
+import image_safety
+from persistence import PersistentStore, utc_now
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +30,10 @@ def load_server(read_only="true", token="a-secure-test-token-that-is-long", oaut
         "NETEASE_COOKIE": "MUSIC_U=test; __csrf=test",
         "MCP_PUBLIC_URL": "https://music.example.test" if oauth else "",
         "MCP_OAUTH_PASSWORD": "a-different-oauth-password" if oauth else "",
+        # Existing direct-write compatibility tests exercise the legacy path.
+        # Production defaults to mandatory preview tokens.
+        "MCP_REQUIRE_WRITE_PREVIEW": "false",
+        "MCP_STORAGE_PATH": "",
     }
     with mock.patch.dict(os.environ, env, clear=False):
         spec = importlib.util.spec_from_file_location("server_under_test", ROOT / "server.py")
@@ -348,6 +360,553 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(payload["playlist_id"], 99)
         self.assertEqual(request.call_args_list[2].kwargs["data"]["op"], "update")
         self.assertEqual(request.call_args_list[2].kwargs["data"]["trackIds"], "[3,2,1]")
+
+
+class PreviewPersistenceAndCoverTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.module = load_server("false")
+        self.module.STORAGE_PATH = str(Path(self.tempdir.name) / "state.sqlite3")
+        self.module.STORE_INSTANCE = None
+        self.module.REQUIRE_WRITE_PREVIEW = True
+
+    def tearDown(self):
+        self.module.STORE_INSTANCE = None
+        self.tempdir.cleanup()
+
+    def seed_operation(self, operation, arguments, before, after, reversible=True):
+        operation_id = str(__import__("uuid").uuid4())
+        store = self.module._store()
+        store.start_operation(
+            {
+                "operation_id": operation_id,
+                "user_id": 7,
+                "operation": operation,
+                "sanitized_arguments": arguments,
+                "target": {"resource_type": "test"},
+                "created_at": utc_now(),
+                "before_state": before,
+                "reversible": reversible,
+                "parent_operation_id": None,
+            }
+        )
+        store.finish_operation(
+            operation_id,
+            status="success",
+            after_state=after,
+            result={"status": "success"},
+        )
+        return operation_id
+
+    def test_new_tool_schemas_and_default_preview_requirement(self):
+        tools = {tool["name"]: tool for tool in self.module.available_tools()}
+        self.assertEqual(
+            tools["update_playlist_cover"]["_meta"]["openai/fileParams"], ["image"]
+        )
+        self.assertTrue(tools["preview_operation"]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools["undo_operation"]["annotations"]["destructiveHint"])
+        with self.assertRaisesRegex(ValueError, "preview_token"):
+            self.module.call_tool("create_playlist", {"name": "Needs preview"})
+
+    def test_write_mode_startup_requires_persistent_storage_path(self):
+        self.module.STORAGE_PATH = ""
+        with self.assertRaisesRegex(SystemExit, "MCP_STORAGE_PATH"):
+            self.module.validate_startup()
+        self.module.STORAGE_PATH = str(Path(self.tempdir.name) / "state.sqlite3")
+        self.module.validate_startup()
+
+    def test_preview_is_read_only_token_bound_persistent_and_idempotent(self):
+        before = {
+            "playlist_id": 1,
+            "creator_id": 7,
+            "name": "Before",
+            "description": "Old",
+        }
+        after = {**before, "name": "After"}
+        arguments = {"playlist_id": 1, "name": "After"}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ), mock.patch.object(self.module, "update_playlist") as write:
+            preview = json.loads(self.module.preview_operation("update_playlist", arguments))
+        write.assert_not_called()
+        self.assertEqual(preview["before_state"], before)
+
+        # Simulate a process restart by reopening the same SQLite file.
+        self.module.STORE_INSTANCE = None
+        formal_arguments = {**arguments, "preview_token": preview["preview_token"]}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ), mock.patch.object(
+            self.module,
+            "_execute_operation_action",
+            return_value={"success": True},
+        ) as action, mock.patch.object(
+            self.module, "_after_state_for_operation", return_value=after
+        ):
+            first = json.loads(self.module.call_tool("update_playlist", formal_arguments))
+            replay = json.loads(self.module.call_tool("update_playlist", formal_arguments))
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(first["operation_id"], replay["operation_id"])
+        self.assertTrue(replay["idempotent_replay"])
+        action.assert_called_once()
+        rows = self.module._store().query_operations(7, limit=10, offset=0)
+        self.assertEqual(len(rows), 1)
+
+    def test_preview_rejects_mismatched_and_expired_tokens(self):
+        before = {"playlist_id": 1, "creator_id": 7, "name": "A", "description": ""}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ):
+            preview = json.loads(
+                self.module.preview_operation(
+                    "update_playlist", {"playlist_id": 1, "name": "B"}
+                )
+            )
+        with mock.patch.object(self.module, "get_uid", return_value=7):
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                self.module.call_tool(
+                    "update_playlist",
+                    {
+                        "playlist_id": 1,
+                        "name": "Different",
+                        "preview_token": preview["preview_token"],
+                    },
+                )
+
+        connection = sqlite3.connect(self.module.STORAGE_PATH)
+        try:
+            connection.execute("UPDATE previews SET expires_at=0")
+            connection.commit()
+        finally:
+            connection.close()
+        with mock.patch.object(self.module, "get_uid", return_value=7):
+            with self.assertRaisesRegex(ValueError, "expired"):
+                self.module.call_tool(
+                    "update_playlist",
+                    {
+                        "playlist_id": 1,
+                        "name": "B",
+                        "preview_token": preview["preview_token"],
+                    },
+                )
+
+    def test_state_conflict_is_logged_without_writing(self):
+        before = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 2]}
+        changed = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 2, 3]}
+        args = {"playlist_id": 1, "song_ids": [2, 1]}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ):
+            preview = json.loads(self.module.preview_operation("reorder_playlist_tracks", args))
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=changed
+        ), mock.patch.object(self.module, "_execute_operation_action") as action:
+            with self.assertRaisesRegex(ValueError, "changed after preview"):
+                self.module.call_tool(
+                    "reorder_playlist_tracks",
+                    {**args, "preview_token": preview["preview_token"]},
+                )
+        action.assert_not_called()
+        rows = self.module._store().query_operations(7, limit=10, offset=0)
+        self.assertEqual(rows[0]["status"], "conflict")
+
+    def test_failure_and_partial_success_are_sanitized_in_log(self):
+        before = {"playlist_id": 1, "creator_id": 7, "name": "A", "description": ""}
+        partial = {**before, "name": "B"}
+        args = {"playlist_id": 1, "name": "B", "description": "C"}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ):
+            preview = json.loads(self.module.preview_operation("update_playlist", args))
+        secret_error = self.module.NetEaseError("upstream echoed " + self.module.NETEASE_COOKIE)
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module,
+            "_current_state_for_operation",
+            side_effect=[before, partial],
+        ), mock.patch.object(
+            self.module, "_execute_operation_action", side_effect=secret_error
+        ):
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool(
+                    "update_playlist", {**args, "preview_token": preview["preview_token"]}
+                )
+        self.assertNotIn("MUSIC_U=test", str(context.exception))
+        rows = self.module._store().query_operations(7, limit=10, offset=0)
+        self.assertEqual(rows[0]["status"], "partial_success")
+        self.assertNotIn("MUSIC_U=test", rows[0]["error_summary"])
+        self.assertIn("[REDACTED]", rows[0]["error_summary"])
+
+    def test_preview_rejects_playlist_without_write_permission(self):
+        playlist = {
+            "creator": {"userId": 8},
+            "name": "Collected",
+            "description": "",
+            "trackCount": 0,
+            "trackIds": [],
+        }
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_playlist_detail", return_value=playlist
+        ):
+            with self.assertRaises(PermissionError):
+                self.module.preview_operation(
+                    "update_playlist", {"playlist_id": 1, "name": "No"}
+                )
+
+    def test_like_undo_restores_state_and_cannot_repeat(self):
+        before = {"song_id": 9, "liked": False}
+        after = {"song_id": 9, "liked": True}
+        original_id = self.seed_operation(
+            "like_song", {"song_id": 9, "like": True}, before, after
+        )
+        with mock.patch.object(
+            self.module, "_liked_song_state", side_effect=[after, before]
+        ), mock.patch.object(self.module, "like_song", return_value="Unliked") as like:
+            result = self.module._perform_undo(original_id, 7, "undo-1")
+        self.assertTrue(result["success"])
+        like.assert_called_once_with(9, False)
+        self.assertEqual(
+            self.module._store().get_operation(original_id, 7)["undo_status"], "succeeded"
+        )
+        with self.assertRaisesRegex(ValueError, "already"):
+            self.module._perform_undo(original_id, 7, "undo-2")
+
+    def test_formal_undo_is_previewed_and_logged_as_its_own_operation(self):
+        before = {"song_id": 9, "liked": False}
+        after = {"song_id": 9, "liked": True}
+        original_id = self.seed_operation(
+            "like_song", {"song_id": 9, "like": True}, before, after
+        )
+        undo_args = {"operation_id": original_id}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module,
+            "_liked_song_state",
+            side_effect=[after, after, after, before],
+        ), mock.patch.object(self.module, "like_song", return_value="Unliked"):
+            preview = json.loads(self.module.preview_operation("undo_operation", undo_args))
+            result = json.loads(
+                self.module.call_tool(
+                    "undo_operation",
+                    {**undo_args, "preview_token": preview["preview_token"]},
+                )
+            )
+        self.assertEqual(result["status"], "success")
+        rows = self.module._store().query_operations(
+            7, limit=10, offset=0, operation="undo_operation"
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["parent_operation_id"], original_id)
+        self.assertFalse(rows[0]["reversible"])
+
+    def test_playlist_undo_paths_restore_metadata_membership_and_order(self):
+        metadata_before = {
+            "playlist_id": 1,
+            "creator_id": 7,
+            "name": "Before",
+            "description": "Old",
+        }
+        metadata_after = {**metadata_before, "name": "After"}
+        update_id = self.seed_operation(
+            "update_playlist",
+            {"playlist_id": 1, "name": "After"},
+            metadata_before,
+            metadata_after,
+        )
+        with mock.patch.object(
+            self.module,
+            "_current_state_for_logged_operation",
+            side_effect=[metadata_after, metadata_before],
+        ), mock.patch.object(self.module, "update_playlist", return_value="restored") as update:
+            self.module._perform_undo(update_id, 7, "undo-update")
+        update.assert_called_once_with(1, "Before", "Old")
+
+        tracks_before = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 2]}
+        tracks_after_add = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 2, 3]}
+        add_id = self.seed_operation(
+            "add_to_playlist",
+            {"playlist_id": 1, "song_ids": [3]},
+            tracks_before,
+            tracks_after_add,
+        )
+        with mock.patch.object(
+            self.module,
+            "_current_state_for_logged_operation",
+            side_effect=[tracks_after_add, tracks_before],
+        ), mock.patch.object(self.module, "manipulate_playlist", return_value="removed") as manipulate:
+            self.module._perform_undo(add_id, 7, "undo-add")
+        manipulate.assert_called_once_with("del", 1, [3])
+
+        tracks_before_remove = {
+            "playlist_id": 1,
+            "creator_id": 7,
+            "track_ids": [1, 2, 3],
+        }
+        tracks_after_remove = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 3]}
+        remove_id = self.seed_operation(
+            "remove_from_playlist",
+            {"playlist_id": 1, "song_ids": [2]},
+            tracks_before_remove,
+            tracks_after_remove,
+        )
+        with mock.patch.object(
+            self.module,
+            "_current_state_for_logged_operation",
+            side_effect=[tracks_after_remove, tracks_before_remove],
+        ), mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ) as manipulate, mock.patch.object(
+            self.module, "reorder_playlist_tracks", return_value="{}"
+        ) as reorder:
+            self.module._perform_undo(remove_id, 7, "undo-remove")
+        manipulate.assert_called_once_with("add", 1, [2])
+        reorder.assert_called_once_with(1, [1, 2, 3])
+
+        reordered = {"playlist_id": 1, "creator_id": 7, "track_ids": [2, 1]}
+        reorder_id = self.seed_operation(
+            "reorder_playlist_tracks",
+            {"playlist_id": 1, "song_ids": [2, 1]},
+            tracks_before,
+            reordered,
+        )
+        with mock.patch.object(
+            self.module,
+            "_current_state_for_logged_operation",
+            side_effect=[reordered, tracks_before],
+        ), mock.patch.object(
+            self.module, "reorder_playlist_tracks", return_value="{}"
+        ) as reorder:
+            self.module._perform_undo(reorder_id, 7, "undo-reorder")
+        reorder.assert_called_once_with(1, [1, 2])
+
+    def test_undo_failure_is_recorded(self):
+        before = {"playlist_id": 1, "creator_id": 7, "track_ids": [1, 2]}
+        after = {"playlist_id": 1, "creator_id": 7, "track_ids": [2, 1]}
+        original_id = self.seed_operation(
+            "reorder_playlist_tracks", {"playlist_id": 1, "song_ids": [2, 1]}, before, after
+        )
+        with mock.patch.object(
+            self.module, "_current_state_for_logged_operation", return_value=after
+        ), mock.patch.object(
+            self.module,
+            "reorder_playlist_tracks",
+            side_effect=self.module.NetEaseError("upstream failed"),
+        ):
+            with self.assertRaises(self.module.NetEaseError):
+                self.module._perform_undo(original_id, 7, "undo-failed")
+        self.assertEqual(
+            self.module._store().get_operation(original_id, 7)["undo_status"], "failed"
+        )
+
+    def test_private_notes_persist_list_with_song_and_detect_conflict(self):
+        args = {
+            "playlist_id": 1,
+            "song_id": 9,
+            "author": "Rain",
+            "content": "For the night drive",
+        }
+        accessible = (7, {"name": "Private mix"}, [9])
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_accessible_playlist", return_value=accessible
+        ):
+            preview = json.loads(self.module.preview_operation("create_interaction_note", args))
+            created = json.loads(
+                self.module.call_tool(
+                    "create_interaction_note", {**args, "preview_token": preview["preview_token"]}
+                )
+            )
+        note = created["after_state"]
+        self.assertEqual(note["version"], 1)
+
+        song = {"id": 9, "name": "Signal", "ar": [{"id": 2, "name": "Artist"}]}
+        with mock.patch.object(
+            self.module, "_accessible_playlist", return_value=accessible
+        ), mock.patch.object(self.module, "_fetch_song_records", return_value=[song]):
+            listed = json.loads(self.module.list_interaction_notes(1))
+        self.assertFalse(listed["notes"][0]["stale"])
+        self.assertEqual(listed["notes"][0]["current_song"]["name"], "Signal")
+        with mock.patch.object(
+            self.module, "_accessible_playlist", return_value=(7, {"name": "Private mix"}, [])
+        ), mock.patch.object(self.module, "_fetch_song_records", return_value=[song]):
+            stale = json.loads(self.module.list_interaction_notes(1))
+        self.assertTrue(stale["notes"][0]["stale"])
+
+        update_args = {"note_id": note["note_id"], "version": 1, "content": "Revised"}
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_accessible_playlist", return_value=accessible
+        ):
+            update_preview = json.loads(
+                self.module.preview_operation("update_interaction_note", update_args)
+            )
+        self.module._store().update_note(note["note_id"], 7, 1, content="Manual edit")
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_accessible_playlist", return_value=accessible
+        ):
+            with self.assertRaisesRegex(ValueError, "version is stale"):
+                self.module.call_tool(
+                    "update_interaction_note",
+                    {**update_args, "preview_token": update_preview["preview_token"]},
+                )
+        rows = self.module._store().query_operations(
+            7, limit=10, offset=0, operation="update_interaction_note"
+        )
+        self.assertEqual(rows[0]["status"], "conflict")
+
+    def test_note_soft_delete_and_undo_restore_content_with_new_version(self):
+        note = self.module._store().create_note(
+            {
+                "note_id": "note-delete-test",
+                "user_id": 7,
+                "playlist_id": 1,
+                "song_id": None,
+                "author": "Rain",
+                "content": "Keep this",
+                "visibility": "private",
+                "created_at": utc_now(),
+            }
+        )
+        delete_args = {"note_id": note["note_id"], "version": 1}
+        accessible = (7, {"name": "Private mix"}, [])
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_accessible_playlist", return_value=accessible
+        ):
+            preview = json.loads(
+                self.module.preview_operation("delete_interaction_note", delete_args)
+            )
+            deleted = json.loads(
+                self.module.call_tool(
+                    "delete_interaction_note",
+                    {**delete_args, "preview_token": preview["preview_token"]},
+                )
+            )
+        self.assertIsNotNone(deleted["after_state"]["deleted_at"])
+        original_id = deleted["operation_id"]
+
+        with mock.patch.object(self.module, "get_uid", return_value=7):
+            undo_preview = json.loads(
+                self.module.preview_operation(
+                    "undo_operation", {"operation_id": original_id}
+                )
+            )
+            restored = json.loads(
+                self.module.call_tool(
+                    "undo_operation",
+                    {
+                        "operation_id": original_id,
+                        "preview_token": undo_preview["preview_token"],
+                    },
+                )
+            )
+        self.assertIsNone(restored["after_state"]["deleted_at"])
+        self.assertEqual(restored["after_state"]["content"], "Keep this")
+        self.assertGreater(restored["after_state"]["version"], 1)
+
+    def test_cover_image_validation_and_normalization(self):
+        source = io.BytesIO()
+        Image.new("RGB", (640, 320), (10, 20, 30)).save(
+            source, format="PNG", pnginfo=None
+        )
+        reference = {
+            "download_url": "https://files.example.test/image",
+            "file_id": "file_test",
+            "mime_type": "image/png",
+            "file_name": "cover.png",
+        }
+        with mock.patch.object(
+            image_safety, "download_file_reference", return_value=source.getvalue()
+        ):
+            output, metadata = image_safety.normalize_cover_image(
+                reference, max_bytes=5_000_000, max_pixels=25_000_000
+            )
+        with Image.open(io.BytesIO(output)) as result:
+            self.assertEqual(result.format, "JPEG")
+            self.assertEqual(result.size, (300, 300))
+            self.assertFalse(result.getexif())
+        self.assertTrue(metadata["center_cropped"])
+        self.assertTrue(metadata["metadata_removed"])
+
+        mismatched = {**reference, "file_name": "cover.jpg"}
+        with mock.patch.object(
+            image_safety, "download_file_reference", return_value=source.getvalue()
+        ):
+            with self.assertRaisesRegex(ValueError, "extension"):
+                image_safety.normalize_cover_image(
+                    mismatched, max_bytes=5_000_000, max_pixels=25_000_000
+                )
+        with mock.patch.object(
+            image_safety, "download_file_reference", return_value=source.getvalue()
+        ):
+            with self.assertRaisesRegex(ValueError, "file-size"):
+                image_safety.normalize_cover_image(
+                    reference, max_bytes=10, max_pixels=25_000_000
+                )
+        with self.assertRaisesRegex(ValueError, "public HTTPS"):
+            image_safety._validate_public_https_url("http://127.0.0.1/private.png")
+        with mock.patch.object(
+            image_safety, "download_file_reference", return_value=source.getvalue()
+        ):
+            with self.assertRaisesRegex(ValueError, "safe PNG or JPEG"):
+                image_safety.normalize_cover_image(
+                    reference, max_bytes=5_000_000, max_pixels=1_000
+                )
+
+    def test_cover_preview_is_irreversible_and_upload_uses_nos_token_privately(self):
+        before = {"playlist_id": 1, "creator_id": 7, "cover_image_id": 10, "cover_image_url": None}
+        args = {
+            "playlist_id": 1,
+            "image": {
+                "download_url": "https://files.example.test/image",
+                "file_id": "file_cover",
+                "mime_type": "image/png",
+                "file_name": "cover.png",
+            },
+        }
+        meta = {
+            "final_format": "JPEG",
+            "final_mime_type": "image/jpeg",
+            "final_width": 300,
+            "final_height": 300,
+        }
+        with mock.patch.object(self.module, "get_uid", return_value=7), mock.patch.object(
+            self.module, "_current_state_for_operation", return_value=before
+        ), mock.patch.object(
+            self.module, "normalize_cover_image", return_value=(b"jpeg", meta)
+        ):
+            preview = json.loads(self.module.preview_operation("update_playlist_cover", args))
+        self.assertFalse(preview["reversible"])
+        self.assertEqual(preview["risk_level"], "high")
+        self.assertNotIn("download_url", json.dumps(preview["normalized_arguments"]))
+
+        allocation = {
+            "code": 200,
+            "result": {"objectKey": "safe/key", "token": "temporary-nos-token", "docId": "55"},
+        }
+        with mock.patch.object(
+            self.module, "netease_request", side_effect=[allocation, {"code": 200}]
+        ), mock.patch.object(
+            self.module, "netease_binary_request", return_value={"code": 200}
+        ) as upload:
+            result = self.module._upload_playlist_cover(1, b"jpeg", meta)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["reversible"])
+        self.assertEqual(upload.call_args.args[2]["x-nos-token"], "temporary-nos-token")
+        self.assertNotIn("temporary-nos-token", json.dumps(result))
+
+    def test_operation_log_survives_store_reopen_and_filters(self):
+        operation_id = self.seed_operation(
+            "like_song",
+            {"song_id": 9, "like": True},
+            {"song_id": 9, "liked": False},
+            {"song_id": 9, "liked": True},
+        )
+        self.module.STORE_INSTANCE = None
+        self.assertIsInstance(
+            PersistentStore(self.module.STORAGE_PATH).get_operation(operation_id, 7), dict
+        )
+        with mock.patch.object(self.module, "get_uid", return_value=7):
+            payload = json.loads(
+                self.module.get_operation_log(operation="like_song", status="success")
+            )
+        self.assertEqual(payload["returned"], 1)
+        self.assertEqual(payload["operations"][0]["operation_id"], operation_id)
 
 
 class HTTPTests(unittest.TestCase):

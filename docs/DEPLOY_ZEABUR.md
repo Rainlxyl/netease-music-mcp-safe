@@ -22,6 +22,23 @@ is the repository root. `zbpack.json` runs the tests during build and starts `py
 
 Zeabur supplies `PORT`; the server reads it automatically.
 
+Before enabling writes, attach a persistent volume mounted at `/data` and add:
+
+| Variable | Recommended value |
+| --- | --- |
+| `MCP_STORAGE_PATH` | `/data/netease-music-mcp.sqlite3` |
+| `MCP_REQUIRE_WRITE_PREVIEW` | `true` |
+| `MCP_PREVIEW_TTL_SECONDS` | `300` |
+| `MCP_OPERATION_RETENTION_DAYS` | `90` |
+| `MCP_MAX_OPERATION_LOGS` | `1000` |
+| `MCP_MAX_IMAGE_BYTES` | `5242880` |
+| `MCP_MAX_IMAGE_PIXELS` | `25000000` |
+
+The SQLite file contains private interaction notes, pending preview state, and sanitized operation
+history. The application filesystem without a volume is ephemeral and must not be used for this
+data. Run one service instance against one SQLite file. Back up the volume or use a
+SQLite-consistent backup before migration or uninstall.
+
 ## 3. Create a domain
 
 Generate a Zeabur domain for the service. Open `https://YOUR-DOMAIN/health`; the expected response
@@ -44,8 +61,10 @@ Do not change `MCP_READ_ONLY` until search, playlists, history and daily recomme
 been tested. When write mode is later enabled, clients should prompt before every account-changing
 tool.
 
-To enable the six existing write tools, including full playlist-track reordering, set
-`MCP_READ_ONLY=false`, redeploy, refresh the app's action definitions, and then disconnect and
-reconnect the ChatGPT app to grant `netease.write` and reload the current tool schemas. Confirm that
-the authorization page lists the account changes before entering the private OAuth password. Do not
-approve write access if the page still describes the connection as read-only.
+To enable write tools, confirm the persistent volume and database path first, then set
+`MCP_READ_ONLY=false`, redeploy, refresh the app's action definitions, and disconnect and reconnect
+the ChatGPT app to grant `netease.write` and reload the current tool schemas. Keep
+`MCP_REQUIRE_WRITE_PREVIEW=true`: ChatGPT must call `preview_operation`, show the proposed state,
+and pass its short-lived token to the matching write. Confirm that the authorization page lists the
+account changes before entering the private OAuth password. Do not approve write access if the page
+still describes the connection as read-only.
