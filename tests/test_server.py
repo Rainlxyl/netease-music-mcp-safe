@@ -160,6 +160,27 @@ class HTTPTests(unittest.TestCase):
         names = {tool["name"] for tool in body["result"]["tools"]}
         self.assertEqual(names, self.module.READ_TOOL_NAMES)
 
+    def test_tool_failure_is_returned_as_mcp_error_content(self):
+        with mock.patch.object(
+            self.module,
+            "netease_request",
+            side_effect=self.module.NetEaseError("Temporary NetEase failure."),
+        ):
+            with self.post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 27,
+                    "method": "tools/call",
+                    "params": {"name": "search_song", "arguments": {"query": "Home"}},
+                },
+                "a-secure-test-token-that-is-long",
+            ) as response:
+                self.assertEqual(response.status, 200)
+                body = json.loads(response.read())
+        self.assertEqual(body["id"], 27)
+        self.assertTrue(body["result"]["isError"])
+        self.assertIn("Temporary NetEase failure", body["result"]["content"][0]["text"])
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):

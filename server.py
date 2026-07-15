@@ -537,6 +537,18 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def tool_error_response(request_id: Any, message: str) -> dict[str, Any]:
+    """Return an MCP tool-level error without breaking the HTTP message stream."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": message}],
+            "isError": True,
+        },
+    }
+
+
 def oauth_enabled() -> bool:
     """Return whether browser-based OAuth is configured for remote MCP clients."""
     return bool(PUBLIC_URL and OAUTH_PASSWORD)
@@ -985,23 +997,24 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        request_id: Any = None
+        tool_call = False
         try:
             body = json.loads(self._read_body())
             if not isinstance(body, dict):
                 raise ValueError("JSON-RPC request must be an object.")
-            if body.get("method") == "tools/call":
+            request_id = body.get("id")
+            tool_call = body.get("method") == "tools/call"
+            if tool_call:
                 params = body.get("params") or {}
                 tool_name = str(params.get("name", "")) if isinstance(params, dict) else ""
                 if tool_name in WRITE_TOOL_NAMES and not self._static_token_authorized():
                     claims = self._oauth_access_claims() or {}
                     if "netease.write" not in str(claims.get("scope", "")).split():
                         self._json(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": body.get("id"),
-                                "error": {"code": -32003, "message": "netease.write scope is required"},
-                            },
-                            HTTPStatus.FORBIDDEN,
+                            tool_error_response(
+                                request_id, "netease.write scope is required"
+                            )
                         )
                         return
             if body.get("id") is None or str(body.get("method", "")).startswith("notifications/"):
@@ -1021,16 +1034,30 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
             )
         except (ValueError, PermissionError) as exc:
-            self._json(
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32602, "message": str(exc)}},
-                HTTPStatus.BAD_REQUEST,
-            )
+            if tool_call:
+                self._json(tool_error_response(request_id, str(exc)))
+            else:
+                self._json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32602, "message": str(exc)},
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
         except NetEaseError as exc:
             LOG.warning("NetEase operation failed: %s", exc)
-            self._json(
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": str(exc)}},
-                HTTPStatus.BAD_GATEWAY,
-            )
+            if tool_call:
+                self._json(tool_error_response(request_id, str(exc)))
+            else:
+                self._json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32001, "message": str(exc)},
+                    },
+                    HTTPStatus.BAD_GATEWAY,
+                )
         except Exception:
             LOG.exception("Unhandled MCP request failure")
             self._json(

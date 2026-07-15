@@ -12,6 +12,7 @@ Cloud Music account. It is derived from
 - Local use binds to `127.0.0.1` by default.
 - Public wildcard CORS is removed.
 - Inputs, request sizes and upstream responses are validated.
+- Upstream tool failures are returned as MCP error content so one failed action does not break the chat stream.
 - Cookies are read only from environment variables and are never returned by `/health`.
 - Destructive tools are clearly identified and require `MCP_READ_ONLY=false`.
 
