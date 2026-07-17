@@ -94,9 +94,10 @@ less precise than the program-level endpoint.
 After deploying this version, refresh the app's action definitions and disconnect/reconnect the
 ChatGPT app before expecting the new podcast tool schemas to appear.
 
-### Preview, execute, audit, and undo
+### Strict and risk-based write policies
 
-The safe production flow is always two calls. First preview the intended write:
+`MCP_WRITE_PREVIEW_POLICY` accepts `strict` or `risk_based` and defaults to `strict`. Under
+`strict`, the safe production flow is always two calls. First preview the intended write:
 
 ```json
 {
@@ -129,12 +130,47 @@ again. If the playlist, like state, note version, or target permission changes a
 write is rejected as a conflict. A process interruption leaves an old in-progress record as
 `unknown`; it is never retried automatically because the upstream result may be ambiguous.
 
-Every previewed write records sanitized arguments, target, timestamps, before/after state, status,
-reversibility, undo state, and a redacted error summary. `get_operation_log` supports `limit`,
+Under `risk_based`, only these validated low-risk writes may run in one call without a preview:
+
+- `add_to_playlist` for a playlist owned by the current user, with 1-10 unique song IDs;
+- `like_song` with `like=true`;
+- `create_interaction_note` with `visibility=private`, an accessible playlist, and an optional
+  `song_id` that is currently in that playlist.
+
+Eleven or more additions are never split automatically. Unlikes, removals, reorders, playlist
+creation or metadata changes, note updates/deletes, undo, cover updates, and every operation that
+does not meet the low-risk conditions still require a matching preview token. All risk-based direct
+writes use the same ownership checks, before/after snapshots, audit records, undo state, redaction,
+and partial/unknown-result handling as previewed writes.
+
+The three low-risk tools accept an optional `idempotency_key` containing 8-100 ASCII letters,
+digits, dots, underscores, colons, or hyphens. The raw key is never stored; SQLite stores its
+SHA-256 digest under a unique `(user_id, operation, idempotency_key)` constraint. Reusing the key
+returns the recorded success or error without another write. A different key permits a later
+intentional operation with identical arguments. The stateless MCP request exposes a JSON-RPC ID,
+but it is not guaranteed to survive a semantic ChatGPT retry and may be reused after reconnecting,
+so the server does not treat it as a durable automatic idempotency key.
+
+Every audited write records sanitized arguments, target, timestamps, before/after state, status,
+reversibility, undo state, `upstream_action_started`, and a redacted error summary.
+`failed_before_upstream` means no mutating request was sent; `unknown` means a mutating request was
+sent but its result could not be confirmed, and it is never automatically retried. A preview that
+fails before the action boundary returns to `pending` until its original expiry time.
+`get_operation_log` supports `limit`,
 `offset`, `operation`, `status`, `created_after`, and `created_before`. Logs are retained for at
-most 90 days and 1,000 records by default. Direct legacy writes can be enabled with
-`MCP_REQUIRE_WRITE_PREVIEW=false` for migration testing, but they do not provide the audit/undo
-guarantees and must not be used in production.
+most 90 days and 1,000 records by default.
+
+Compatibility precedence is explicit:
+
+1. If `MCP_WRITE_PREVIEW_POLICY` is set, it wins and must be `strict` or `risk_based`.
+2. If it is absent, `MCP_REQUIRE_WRITE_PREVIEW=true` maps to `strict`.
+3. If it is absent and the legacy variable is `false`, the old unaudited direct-write behavior is
+   retained only for compatibility and must not be used in production.
+4. If both variables conflict, startup logs the final policy and that the legacy variable was
+   ignored; no credential or other secret is logged.
+
+Existing SQLite files migrate automatically by adding the action-boundary and hashed-idempotency
+columns plus a partial unique index. Back up the persistent volume before deployment as usual.
 
 `undo_operation` itself must be previewed. It permits only a successful record marked reversible,
 checks that the recorded after-state is still current, writes its own audit record, and refuses a
@@ -255,14 +291,17 @@ Set the following environment variables in Zeabur's dashboard, never in Git:
 - `MCP_PUBLIC_URL`: public HTTPS origin, for example `https://YOUR-SERVICE.zeabur.app`
 - `MCP_OAUTH_PASSWORD`: a separate random password of at least 16 characters for one-time browser authorization
 - `MCP_STORAGE_PATH`: for example `/data/netease-music-mcp.sqlite3` on a mounted persistent volume
+- `MCP_WRITE_PREVIEW_POLICY`: `strict` (default) or `risk_based`
 
 The MCP endpoint will be `https://YOUR-SERVICE.zeabur.app/mcp`.
 
 ### Optional write mode
 
-After all read tools have been tested, mount a persistent volume at `/data`, keep
-`MCP_REQUIRE_WRITE_PREVIEW=true`, and set `MCP_READ_ONLY=false` to expose account and private-note
-writes. The OAuth page then shows a separate write-access warning and requires explicit
+After all read tools have been tested, mount a persistent volume at `/data`, set
+`MCP_WRITE_PREVIEW_POLICY=strict` for the original two-step flow or explicitly choose
+`risk_based`, and set `MCP_READ_ONLY=false` to expose account and private-note writes. Keep the
+legacy `MCP_REQUIRE_WRITE_PREVIEW=true` while migrating; the new variable takes precedence. The
+OAuth page then shows a separate write-access warning and requires explicit
 confirmation. Keep ChatGPT's write-action confirmations enabled while testing. Use one service
 instance per SQLite file; horizontal multi-writer deployment requires a database backend that this
 version does not yet provide.

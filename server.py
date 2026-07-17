@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Callable
 
 from image_safety import normalize_cover_image, validate_file_reference
 from persistence import PersistentStore, utc_now
@@ -51,12 +51,21 @@ MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
 STORAGE_PATH = os.environ.get("MCP_STORAGE_PATH", "").strip()
-REQUIRE_WRITE_PREVIEW = os.environ.get("MCP_REQUIRE_WRITE_PREVIEW", "true").strip().lower() not in {
+LEGACY_WRITE_PREVIEW_EXPLICIT = "MCP_REQUIRE_WRITE_PREVIEW" in os.environ
+LEGACY_WRITE_PREVIEW_RAW = os.environ.get("MCP_REQUIRE_WRITE_PREVIEW", "true").strip().lower()
+REQUIRE_WRITE_PREVIEW = LEGACY_WRITE_PREVIEW_RAW not in {
     "0",
     "false",
     "no",
     "off",
 }
+CONFIGURED_WRITE_PREVIEW_POLICY = os.environ.get("MCP_WRITE_PREVIEW_POLICY")
+if CONFIGURED_WRITE_PREVIEW_POLICY is None:
+    WRITE_PREVIEW_POLICY = "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
+    WRITE_PREVIEW_POLICY_SOURCE = "MCP_REQUIRE_WRITE_PREVIEW"
+else:
+    WRITE_PREVIEW_POLICY = CONFIGURED_WRITE_PREVIEW_POLICY.strip().lower()
+    WRITE_PREVIEW_POLICY_SOURCE = "MCP_WRITE_PREVIEW_POLICY"
 PREVIEW_TTL_SECONDS = int(os.environ.get("MCP_PREVIEW_TTL_SECONDS", "300"))
 OPERATION_RETENTION_DAYS = int(os.environ.get("MCP_OPERATION_RETENTION_DAYS", "90"))
 MAX_OPERATION_LOGS = int(os.environ.get("MCP_MAX_OPERATION_LOGS", "1000"))
@@ -70,6 +79,12 @@ FAILED_LOGINS: dict[str, list[int]] = {}
 FAILED_LOGINS_LOCK = threading.Lock()
 STORE_INSTANCE: PersistentStore | None = None
 STORE_LOCK = threading.Lock()
+
+
+def _effective_write_preview_policy() -> str:
+    if WRITE_PREVIEW_POLICY_SOURCE == "MCP_REQUIRE_WRITE_PREVIEW":
+        return "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
+    return WRITE_PREVIEW_POLICY
 
 READ_TOOL_NAMES = {
     "search_song",
@@ -297,7 +312,7 @@ WRITE_TOOLS = [
     ),
     _tool(
         "add_to_playlist",
-        "Add one or more song IDs to a playlist. This changes the NetEase account.",
+        "Add song IDs to a playlist. Under risk_based policy, an owned playlist and 1-10 songs may be written once without preview; larger writes require preview.",
         {
             "playlist_id": {"type": "integer", "minimum": 1},
             "song_ids": {
@@ -307,6 +322,12 @@ WRITE_TOOLS = [
                 "maxItems": 50,
             },
             "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 100,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+            },
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -347,11 +368,17 @@ WRITE_TOOLS = [
     ),
     _tool(
         "like_song",
-        "Like or unlike a song. This changes the NetEase account.",
+        "Like or unlike a song. Under risk_based policy, like=true may be written once without preview; unlike always requires preview.",
         {
             "song_id": {"type": "integer", "minimum": 1},
             "like": {"type": "boolean", "default": True},
             "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 100,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+            },
         },
         ["song_id"],
         read_only=False,
@@ -393,7 +420,7 @@ WRITE_TOOLS = [
     ),
     _tool(
         "create_interaction_note",
-        "Create a private plugin-owned playlist or track note in persistent storage. This does not create a native NetEase comment.",
+        "Create a private plugin-owned playlist or track note. Under risk_based policy, a validated private note may be written once without preview.",
         {
             "playlist_id": {"type": "integer", "minimum": 1},
             "song_id": {"type": "integer", "minimum": 1},
@@ -401,8 +428,14 @@ WRITE_TOOLS = [
             "content": {"type": "string", "minLength": 1, "maxLength": 2000},
             "visibility": {"type": "string", "enum": ["private"], "default": "private"},
             "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 100,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+            },
         },
-        ["playlist_id", "author", "content", "preview_token"],
+        ["playlist_id", "author", "content"],
         read_only=False,
     ),
     _tool(
@@ -438,6 +471,10 @@ class NetEaseError(RuntimeError):
     pass
 
 
+class UpstreamOutcomeUnknown(NetEaseError):
+    """A mutating request may have reached upstream, but its result was not readable."""
+
+
 def _require_cookie() -> None:
     if not NETEASE_COOKIE or "MUSIC_U=" not in NETEASE_COOKIE:
         raise NetEaseError("NetEase credentials are not configured.")
@@ -467,9 +504,9 @@ def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[
     except urllib.error.HTTPError as exc:
         raise NetEaseError(f"NetEase request failed with HTTP {exc.code}.") from None
     except urllib.error.URLError:
-        raise NetEaseError("NetEase could not be reached.") from None
+        raise UpstreamOutcomeUnknown("NetEase could not be reached; the result is unknown.") from None
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise NetEaseError("NetEase returned an unreadable response.") from None
+        raise UpstreamOutcomeUnknown("NetEase returned an unreadable response; the result is unknown.") from None
 
 
 def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> dict[str, Any]:
@@ -480,13 +517,17 @@ def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> di
     except urllib.error.HTTPError as exc:
         raise NetEaseError(f"NetEase image upload failed with HTTP {exc.code}.") from None
     except urllib.error.URLError:
-        raise NetEaseError("NetEase image storage could not be reached.") from None
+        raise UpstreamOutcomeUnknown(
+            "NetEase image storage could not be reached; the result is unknown."
+        ) from None
     if not payload:
         return {"code": 200}
     try:
         result = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise NetEaseError("NetEase image storage returned an unreadable response.") from None
+        raise UpstreamOutcomeUnknown(
+            "NetEase image storage returned an unreadable response; the result is unknown."
+        ) from None
     if not isinstance(result, dict):
         raise NetEaseError("NetEase image storage returned an unexpected response.")
     return result
@@ -1600,12 +1641,35 @@ def _clean_note_content(value: Any) -> str:
     return value.strip()
 
 
+def _clean_idempotency_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+    if (
+        not isinstance(value, str)
+        or not 8 <= len(value) <= 100
+        or any(character not in allowed for character in value)
+    ):
+        raise ValueError(
+            "idempotency_key must be 8 to 100 ASCII letters, digits, dots, underscores, colons, or hyphens."
+        )
+    return value
+
+
+def _idempotency_key_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _normalize_write_arguments(operation: str, arguments: Any) -> dict[str, Any]:
     if operation not in WRITE_TOOL_NAMES:
         raise ValueError("operation must name an available write tool.")
     if not isinstance(arguments, dict):
         raise ValueError("arguments must be an object.")
-    arguments = {key: value for key, value in arguments.items() if key != "preview_token"}
+    arguments = {
+        key: value
+        for key, value in arguments.items()
+        if key not in {"preview_token", "idempotency_key"}
+    }
     if operation == "create_playlist":
         name = arguments.get("name")
         description = arguments.get("description", "")
@@ -1754,13 +1818,12 @@ def _current_state_for_logged_operation(record: dict[str, Any], user_id: int) ->
     return _current_state_for_operation(operation, arguments, user_id)
 
 
-def preview_operation(operation: Any, arguments: Any) -> str:
-    if READ_ONLY:
-        raise PermissionError("Write tools are disabled; previews are available in read-write mode.")
-    if not isinstance(operation, str):
-        raise ValueError("operation must be a string.")
-    normalized = _normalize_write_arguments(operation, arguments)
-    user_id = get_uid()
+def _build_operation_plan(
+    operation: str,
+    normalized: dict[str, Any],
+    raw_arguments: dict[str, Any],
+    user_id: int,
+) -> dict[str, Any]:
     before_state = _current_state_for_operation(operation, normalized, user_id)
     target: dict[str, Any]
     expected_after: Any
@@ -1810,7 +1873,7 @@ def preview_operation(operation: Any, arguments: Any) -> str:
             risk_level = "high"
     elif operation == "update_playlist_cover":
         target = {"resource_type": "playlist_cover", "playlist_id": normalized["playlist_id"]}
-        raw_reference = arguments.get("image") if isinstance(arguments, dict) else None
+        raw_reference = raw_arguments.get("image")
         artifact, artifact_meta = normalize_cover_image(
             raw_reference,
             max_bytes=MAX_IMAGE_BYTES,
@@ -1854,6 +1917,27 @@ def preview_operation(operation: Any, arguments: Any) -> str:
     else:
         raise ValueError("Unsupported write operation.")
 
+    return {
+        "target": target,
+        "before": before_state,
+        "expected_after": expected_after,
+        "state_hash": _state_hash(before_state),
+        "risk_level": risk_level,
+        "reversible": reversible,
+        "artifact": artifact,
+        "artifact_meta": artifact_meta,
+    }
+
+
+def preview_operation(operation: Any, arguments: Any) -> str:
+    if READ_ONLY:
+        raise PermissionError("Write tools are disabled; previews are available in read-write mode.")
+    if not isinstance(operation, str):
+        raise ValueError("operation must be a string.")
+    normalized = _normalize_write_arguments(operation, arguments)
+    user_id = get_uid()
+    plan = _build_operation_plan(operation, normalized, arguments, user_id)
+
     preview_token = secrets.token_urlsafe(32)
     created_at = utc_now()
     expires_at = time.time() + PREVIEW_TTL_SECONDS
@@ -1865,14 +1949,14 @@ def preview_operation(operation: Any, arguments: Any) -> str:
             "operation": operation,
             "arguments": normalized,
             "sanitized_arguments": sanitized_arguments,
-            "target": target,
-            "before_state": before_state,
-            "expected_after_state": expected_after,
-            "state_hash": _state_hash(before_state),
-            "risk_level": risk_level,
-            "reversible": reversible,
-            "artifact": artifact,
-            "artifact_meta": artifact_meta,
+            "target": plan["target"],
+            "before_state": plan["before"],
+            "expected_after_state": plan["expected_after"],
+            "state_hash": plan["state_hash"],
+            "risk_level": plan["risk_level"],
+            "reversible": plan["reversible"],
+            "artifact": plan["artifact"],
+            "artifact_meta": plan["artifact_meta"],
             "created_at": created_at,
             "expires_at": expires_at,
         }
@@ -1881,11 +1965,11 @@ def preview_operation(operation: Any, arguments: Any) -> str:
         {
             "operation": operation,
             "normalized_arguments": sanitized_arguments,
-            "target": target,
-            "before_state": before_state,
-            "expected_after_state": expected_after,
-            "risk_level": risk_level,
-            "reversible": reversible,
+            "target": plan["target"],
+            "before_state": plan["before"],
+            "expected_after_state": plan["expected_after"],
+            "risk_level": plan["risk_level"],
+            "reversible": plan["reversible"],
             "preview_token": preview_token,
             "created_at": created_at,
             "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1910,6 +1994,7 @@ def get_operation_log(
         "started",
         "success",
         "failed",
+        "failed_before_upstream",
         "partial_success",
         "conflict",
         "unknown",
@@ -2069,8 +2154,10 @@ def _execute_operation_action(
     preview: dict[str, Any],
     user_id: int,
     operation_id: str,
+    mark_upstream_action_started: Callable[[], None],
 ) -> dict[str, Any]:
     if operation == "create_playlist":
+        mark_upstream_action_started()
         response = netease_request(
             "https://music.163.com/api/playlist/create?csrf_token=" + get_csrf(),
             data={
@@ -2090,6 +2177,7 @@ def _execute_operation_action(
             "privacy": arguments["privacy"],
         }
     if operation == "update_playlist":
+        mark_upstream_action_started()
         message = update_playlist(
             arguments["playlist_id"],
             arguments.get("name"),
@@ -2101,23 +2189,38 @@ def _execute_operation_action(
         actual_ids = [song_id for song_id in arguments["song_ids"] if song_id not in before_ids]
         if not actual_ids:
             return {"success": True, "changed": False, "message": "All songs were already present."}
+        valid_songs = _fetch_song_records(actual_ids)
+        valid_ids = {
+            song.get("id") for song in valid_songs if isinstance(song, dict)
+        }
+        missing_ids = [song_id for song_id in actual_ids if song_id not in valid_ids]
+        if missing_ids:
+            raise ValueError(f"NetEase did not recognize song IDs: {missing_ids}.")
+        mark_upstream_action_started()
         message = manipulate_playlist("add", arguments["playlist_id"], actual_ids)
         return {"success": True, "changed": True, "song_ids": actual_ids, "message": message}
     if operation == "remove_from_playlist":
+        mark_upstream_action_started()
         message = manipulate_playlist("del", arguments["playlist_id"], arguments["song_ids"])
         return {"success": True, "changed": True, "song_ids": arguments["song_ids"], "message": message}
     if operation == "reorder_playlist_tracks":
+        mark_upstream_action_started()
         return json.loads(reorder_playlist_tracks(arguments["playlist_id"], arguments["song_ids"]))
     if operation == "like_song":
+        if preview.get("before") == preview.get("expected_after"):
+            return {"success": True, "changed": False, "message": "Like state already matched."}
+        mark_upstream_action_started()
         message = like_song(arguments["song_id"], arguments["like"])
-        return {"success": True, "message": message}
+        return {"success": True, "changed": True, "message": message}
     if operation == "update_playlist_cover":
         artifact = preview.get("artifact")
         image_meta = preview.get("artifact_meta")
         if not isinstance(artifact, bytes) or not isinstance(image_meta, dict):
             raise ValueError("The preview no longer contains the processed image; create a new preview.")
+        mark_upstream_action_started()
         return _upload_playlist_cover(arguments["playlist_id"], artifact, image_meta)
     if operation == "create_interaction_note":
+        mark_upstream_action_started()
         note = _store().create_note(
             {
                 "note_id": str(uuid.uuid4()),
@@ -2132,6 +2235,7 @@ def _execute_operation_action(
         )
         return {"success": True, "note": _note_snapshot(note)}
     if operation == "update_interaction_note":
+        mark_upstream_action_started()
         note = _store().update_note(
             arguments["note_id"],
             user_id,
@@ -2141,11 +2245,13 @@ def _execute_operation_action(
         )
         return {"success": True, "note": _note_snapshot(note)}
     if operation == "delete_interaction_note":
+        mark_upstream_action_started()
         note = _store().soft_delete_note(
             arguments["note_id"], user_id, arguments["version"]
         )
         return {"success": True, "soft_deleted": True, "note": _note_snapshot(note)}
     if operation == "undo_operation":
+        mark_upstream_action_started()
         return _perform_undo(arguments["operation_id"], user_id, operation_id)
     raise ValueError("Unsupported write operation.")
 
@@ -2262,6 +2368,300 @@ def _best_effort_after_state(
         return None
 
 
+def _idempotent_operation_replay(
+    record: dict[str, Any], normalized: dict[str, Any]
+) -> str:
+    if _canonical_json(record.get("sanitized_arguments")) != _canonical_json(
+        _sanitize_value(normalized)
+    ):
+        raise ValueError(
+            "This idempotency_key was already used with different arguments."
+        )
+    status = str(record.get("status", "unknown"))
+    if status == "started":
+        raise ValueError("An operation with this idempotency_key is already executing.")
+    result = dict(record.get("result") or {})
+    result["idempotent_replay"] = True
+    result.setdefault("operation_id", record.get("operation_id"))
+    result.setdefault("operation", record.get("operation"))
+    result.setdefault("status", status)
+    if status == "success":
+        return _json_text(result)
+    error = record.get("error_summary") or (
+        "The previous result is unknown and was not retried."
+        if status == "unknown"
+        else "The previous execution did not succeed and was not repeated."
+    )
+    raise NetEaseError(f"{error} Idempotent replay did not send another write.")
+
+
+def _verify_added_playlist_tracks(
+    before_state: dict[str, Any] | None,
+    expected_after_state: dict[str, Any] | None,
+    after_state: dict[str, Any] | None,
+    requested_song_ids: list[int],
+) -> bool:
+    """Verify add membership without assuming where NetEase inserts new tracks."""
+    before_ids = list((before_state or {}).get("track_ids", []))
+    expected_ids = list((expected_after_state or {}).get("track_ids", []))
+    after_ids = list((after_state or {}).get("track_ids", []))
+    newly_added_ids = [
+        song_id for song_id in requested_song_ids if song_id not in before_ids
+    ]
+
+    missing_targets = [
+        song_id for song_id in requested_song_ids if song_id not in after_ids
+    ]
+    duplicate_targets = [
+        song_id for song_id in requested_song_ids if after_ids.count(song_id) != 1
+    ]
+    missing_originals = [
+        song_id for song_id in set(before_ids) if song_id not in after_ids
+    ]
+    expected_count = len(before_ids) + len(newly_added_ids)
+
+    problems = []
+    if missing_targets:
+        problems.append(f"{len(missing_targets)} requested track(s) missing")
+    if duplicate_targets:
+        problems.append(f"{len(duplicate_targets)} requested track(s) duplicated")
+    if missing_originals:
+        problems.append(f"{len(missing_originals)} original track(s) missing")
+    if len(after_ids) != expected_count:
+        problems.append(
+            f"track count is {len(after_ids)} instead of the expected {expected_count}"
+        )
+    if problems:
+        raise NetEaseError(
+            "NetEase returned an inconsistent playlist after adding tracks: "
+            + "; ".join(problems)
+            + ". No automatic retry was attempted."
+        )
+    return after_ids != expected_ids
+
+
+def _execute_audited_write(
+    operation: str,
+    normalized: dict[str, Any],
+    plan: dict[str, Any],
+    user_id: int,
+    *,
+    preview_token_hash: str | None = None,
+    idempotency_key: str | None = None,
+    revalidate_preview: bool = False,
+) -> str:
+    if idempotency_key is not None:
+        existing = _store().get_operation_by_idempotency(
+            user_id, operation, idempotency_key
+        )
+        if existing is not None:
+            return _idempotent_operation_replay(existing, normalized)
+
+    operation_id = str(uuid.uuid4())
+    inserted = _store().start_operation(
+        {
+            "operation_id": operation_id,
+            "user_id": user_id,
+            "operation": operation,
+            "sanitized_arguments": _sanitize_value(normalized),
+            "target": plan.get("target"),
+            "created_at": utc_now(),
+            "before_state": plan.get("before"),
+            "reversible": plan.get("reversible"),
+            "parent_operation_id": normalized.get("operation_id")
+            if operation == "undo_operation"
+            else None,
+            "idempotency_key": idempotency_key,
+        }
+    )
+    if not inserted:
+        existing = _store().get_operation_by_idempotency(
+            user_id, operation, str(idempotency_key)
+        )
+        if existing is None:
+            raise NetEaseError("The idempotent operation could not be recovered safely.")
+        return _idempotent_operation_replay(existing, normalized)
+
+    upstream_action_started = False
+
+    def mark_upstream_action_started() -> None:
+        nonlocal upstream_action_started
+        if not upstream_action_started:
+            _store().mark_upstream_action_started(operation_id)
+            upstream_action_started = True
+
+    try:
+        if revalidate_preview:
+            try:
+                current_state = _current_state_for_operation(operation, normalized, user_id)
+            except (ValueError, PermissionError) as exc:
+                error = _redact_secrets(exc)
+                conflict_result = {
+                    "operation_id": operation_id,
+                    "operation": operation,
+                    "status": "conflict",
+                    "upstream_action_started": False,
+                    "error_summary": error,
+                }
+                _store().finish_operation(
+                    operation_id,
+                    status="conflict",
+                    after_state=_best_effort_after_state(operation, normalized, user_id),
+                    result=conflict_result,
+                    error_summary=error,
+                )
+                if preview_token_hash is not None:
+                    _store().finish_preview(
+                        preview_token_hash,
+                        "conflict",
+                        operation_id=operation_id,
+                        result=conflict_result,
+                    )
+                if isinstance(exc, PermissionError):
+                    raise PermissionError(error) from None
+                raise ValueError(error) from None
+            if _state_hash(current_state) != plan.get("state_hash"):
+                error = (
+                    "The resource changed after preview; no write was performed. "
+                    "Create a new preview."
+                )
+                conflict_result = {
+                    "operation_id": operation_id,
+                    "operation": operation,
+                    "status": "conflict",
+                    "upstream_action_started": False,
+                    "error_summary": error,
+                }
+                _store().finish_operation(
+                    operation_id,
+                    status="conflict",
+                    after_state=current_state,
+                    result=conflict_result,
+                    error_summary=error,
+                )
+                if preview_token_hash is not None:
+                    _store().finish_preview(
+                        preview_token_hash,
+                        "conflict",
+                        operation_id=operation_id,
+                        result=conflict_result,
+                    )
+                raise ValueError(error)
+
+        action_result = _execute_operation_action(
+            operation,
+            normalized,
+            plan,
+            user_id,
+            operation_id,
+            mark_upstream_action_started,
+        )
+        after_state = _after_state_for_operation(
+            operation, normalized, action_result, user_id
+        )
+        deterministic_operations = {
+            "update_playlist",
+            "remove_from_playlist",
+            "reorder_playlist_tracks",
+            "like_song",
+        }
+        if operation == "add_to_playlist":
+            order_changed = _verify_added_playlist_tracks(
+                plan.get("before"),
+                plan.get("expected_after"),
+                after_state,
+                normalized["song_ids"],
+            )
+            if order_changed:
+                action_result["order_changed_by_upstream"] = True
+        if operation in deterministic_operations and _canonical_json(
+            after_state
+        ) != _canonical_json(plan.get("expected_after")):
+            raise NetEaseError(
+                "The write completed, but the resulting state did not match the expected state. "
+                "No automatic retry was attempted."
+            )
+        if operation == "update_playlist_cover":
+            expected_image_id = action_result.get("upstream_image_id")
+            actual_image_id = (after_state or {}).get("cover_image_id")
+            if actual_image_id is not None and str(actual_image_id) != str(expected_image_id):
+                raise NetEaseError(
+                    "NetEase accepted the cover update, but the playlist still reports a different cover image."
+                )
+            action_result["verified"] = actual_image_id is not None
+        final_result = {
+            "operation_id": operation_id,
+            "operation": operation,
+            "status": "success",
+            "upstream_action_started": upstream_action_started,
+            "result": action_result,
+            "before_state": plan.get("before"),
+            "after_state": after_state,
+            "reversible": bool(plan.get("reversible")),
+        }
+        _store().finish_operation(
+            operation_id, status="success", after_state=after_state, result=final_result
+        )
+        if preview_token_hash is not None:
+            _store().finish_preview(
+                preview_token_hash,
+                "consumed",
+                operation_id=operation_id,
+                result=final_result,
+            )
+        return _json_text(final_result)
+    except Exception as exc:
+        existing = _store().get_operation(operation_id, user_id)
+        if existing and existing.get("status") in {"conflict", "success"}:
+            raise
+        safe_error = _redact_secrets(exc)
+        if not upstream_action_started:
+            status = "failed_before_upstream"
+            after_state = plan.get("before")
+        else:
+            after_state = _best_effort_after_state(operation, normalized, user_id)
+            changed = after_state is not None and _canonical_json(
+                after_state
+            ) != _canonical_json(plan.get("before"))
+            if changed:
+                status = "partial_success"
+            elif isinstance(exc, UpstreamOutcomeUnknown):
+                status = "unknown"
+            else:
+                status = "failed"
+        failure_result = {
+            "operation_id": operation_id,
+            "operation": operation,
+            "status": status,
+            "upstream_action_started": upstream_action_started,
+            "error_summary": safe_error,
+        }
+        _store().finish_operation(
+            operation_id,
+            status=status,
+            after_state=after_state,
+            result=failure_result,
+            error_summary=safe_error,
+        )
+        if preview_token_hash is not None:
+            if upstream_action_started:
+                _store().finish_preview(
+                    preview_token_hash,
+                    "consumed",
+                    operation_id=operation_id,
+                    result=failure_result,
+                )
+            else:
+                _store().release_preview(
+                    preview_token_hash, operation_id, failure_result
+                )
+        if isinstance(exc, PermissionError):
+            raise PermissionError(safe_error) from None
+        if isinstance(exc, ValueError):
+            raise ValueError(safe_error) from None
+        raise NetEaseError(safe_error) from None
+
+
 def _execute_previewed_operation(
     operation: str, raw_arguments: dict[str, Any], preview_token: Any
 ) -> str:
@@ -2276,144 +2676,138 @@ def _execute_previewed_operation(
     if claim_status == "consumed":
         result = preview.get("result") or {}
         if result.get("status") != "success":
-            raise NetEaseError(result.get("error_summary") or "The previous execution attempt failed.")
+            raise NetEaseError(
+                result.get("error_summary") or "The previous execution attempt failed."
+            )
         result["idempotent_replay"] = True
         return _json_text(result)
-
-    operation_id = str(uuid.uuid4())
-    _store().start_operation(
-        {
-            "operation_id": operation_id,
-            "user_id": user_id,
-            "operation": operation,
-            "sanitized_arguments": preview.get("sanitized_arguments"),
-            "target": preview.get("target"),
-            "created_at": utc_now(),
-            "before_state": preview.get("before"),
-            "reversible": preview.get("reversible"),
-            "parent_operation_id": normalized.get("operation_id") if operation == "undo_operation" else None,
-        }
+    return _execute_audited_write(
+        operation,
+        normalized,
+        preview,
+        user_id,
+        preview_token_hash=token_hash,
+        revalidate_preview=True,
     )
+
+
+def _risk_based_direct_eligible(operation: str, normalized: dict[str, Any]) -> bool:
+    if operation == "add_to_playlist":
+        return 1 <= len(normalized["song_ids"]) <= 10
+    if operation == "like_song":
+        return normalized["like"] is True
+    if operation == "create_interaction_note":
+        return normalized["visibility"] == "private"
+    return False
+
+
+def _risk_based_direct_candidate(
+    operation: str, raw_arguments: dict[str, Any]
+) -> bool:
+    if operation == "add_to_playlist":
+        raw_ids = raw_arguments.get("song_ids")
+        return not isinstance(raw_ids, list) or len(raw_ids) <= 10
+    if operation == "like_song":
+        return raw_arguments.get("like", True) is not False
+    if operation == "create_interaction_note":
+        return raw_arguments.get("visibility", "private") == "private"
+    return False
+
+
+def _execute_risk_based_direct(
+    operation: str, raw_arguments: dict[str, Any]
+) -> str:
+    if not _risk_based_direct_candidate(operation, raw_arguments):
+        raise ValueError(
+            "This operation requires a matching preview_token under risk_based policy."
+        )
+    normalized = _normalize_write_arguments(operation, raw_arguments)
+    if not _risk_based_direct_eligible(operation, normalized):
+        raise ValueError(
+            "This operation requires a matching preview_token under risk_based policy."
+        )
+    raw_idempotency_key = _clean_idempotency_key(raw_arguments.get("idempotency_key"))
+    idempotency_key = (
+        _idempotency_key_hash(raw_idempotency_key)
+        if raw_idempotency_key is not None
+        else None
+    )
+    user_id = get_uid()
+    if idempotency_key is not None:
+        existing = _store().get_operation_by_idempotency(
+            user_id, operation, idempotency_key
+        )
+        if existing is not None:
+            return _idempotent_operation_replay(existing, normalized)
     try:
-        try:
-            current_state = _current_state_for_operation(operation, normalized, user_id)
-        except (ValueError, PermissionError) as exc:
-            error = _redact_secrets(exc)
-            conflict_result = {
-                "operation_id": operation_id,
-                "operation": operation,
-                "status": "conflict",
-                "error_summary": error,
-            }
-            _store().finish_operation(
-                operation_id,
-                status="conflict",
-                after_state=_best_effort_after_state(operation, normalized, user_id),
-                result=conflict_result,
-                error_summary=error,
-            )
-            _store().finish_preview(
-                token_hash, "conflict", operation_id=operation_id, result=conflict_result
-            )
-            if isinstance(exc, PermissionError):
-                raise PermissionError(error) from None
-            raise ValueError(error) from None
-        if _state_hash(current_state) != preview.get("state_hash"):
-            error = "The resource changed after preview; no write was performed. Create a new preview."
-            conflict_result = {
-                "operation_id": operation_id,
-                "operation": operation,
-                "status": "conflict",
-                "error_summary": error,
-            }
-            _store().finish_operation(
-                operation_id,
-                status="conflict",
-                after_state=current_state,
-                result=conflict_result,
-                error_summary=error,
-            )
-            _store().finish_preview(
-                token_hash, "conflict", operation_id=operation_id, result=conflict_result
-            )
-            raise ValueError(error)
-        action_result = _execute_operation_action(
-            operation, normalized, preview, user_id, operation_id
-        )
-        after_state = _after_state_for_operation(operation, normalized, action_result, user_id)
-        deterministic_operations = {
-            "update_playlist",
-            "add_to_playlist",
-            "remove_from_playlist",
-            "reorder_playlist_tracks",
-            "like_song",
-        }
-        if operation in deterministic_operations and _canonical_json(after_state) != _canonical_json(
-            preview.get("expected_after")
-        ):
-            raise NetEaseError(
-                "NetEase accepted the write, but the resulting state did not match the preview. No automatic retry was attempted."
-            )
-        if operation == "update_playlist_cover":
-            expected_image_id = action_result.get("upstream_image_id")
-            actual_image_id = (after_state or {}).get("cover_image_id")
-            if actual_image_id is not None and str(actual_image_id) != str(expected_image_id):
-                raise NetEaseError(
-                    "NetEase accepted the cover update, but the playlist still reports a different cover image."
-                )
-            action_result["verified"] = actual_image_id is not None
-        final_result = {
-            "operation_id": operation_id,
-            "operation": operation,
-            "status": "success",
-            "result": action_result,
-            "before_state": preview.get("before"),
-            "after_state": after_state,
-            "reversible": bool(preview.get("reversible")),
-        }
-        _store().finish_operation(
-            operation_id,
-            status="success",
-            after_state=after_state,
-            result=final_result,
-        )
-        _store().finish_preview(
-            token_hash, "consumed", operation_id=operation_id, result=final_result
-        )
-        return _json_text(final_result)
+        plan = _build_operation_plan(operation, normalized, raw_arguments, user_id)
     except Exception as exc:
-        existing = _store().get_operation(operation_id, user_id)
-        if existing and existing.get("status") in {"conflict", "success"}:
-            raise
-        safe_error = _redact_secrets(exc)
-        after_state = _best_effort_after_state(operation, normalized, user_id)
-        status = (
-            "partial_success"
-            if after_state is not None
-            and _canonical_json(after_state) != _canonical_json(preview.get("before"))
-            else "failed"
+        operation_id = str(uuid.uuid4())
+        target = (
+            {
+                "resource_type": "playlist_tracks",
+                "playlist_id": normalized.get("playlist_id"),
+            }
+            if operation == "add_to_playlist"
+            else {
+                "resource_type": "song_like",
+                "song_id": normalized.get("song_id"),
+            }
+            if operation == "like_song"
+            else {
+                "resource_type": "interaction_note",
+                "playlist_id": normalized.get("playlist_id"),
+                "song_id": normalized.get("song_id"),
+            }
         )
-        failure_result = {
+        inserted = _store().start_operation(
+            {
+                "operation_id": operation_id,
+                "user_id": user_id,
+                "operation": operation,
+                "sanitized_arguments": _sanitize_value(normalized),
+                "target": target,
+                "created_at": utc_now(),
+                "before_state": None,
+                "reversible": False,
+                "parent_operation_id": None,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        if not inserted:
+            existing = _store().get_operation_by_idempotency(
+                user_id, operation, str(idempotency_key)
+            )
+            if existing is not None:
+                return _idempotent_operation_replay(existing, normalized)
+            raise NetEaseError("The idempotent preflight failure could not be recovered safely.")
+        safe_error = _redact_secrets(exc)
+        result = {
             "operation_id": operation_id,
             "operation": operation,
-            "status": status,
+            "status": "failed_before_upstream",
+            "upstream_action_started": False,
             "error_summary": safe_error,
         }
         _store().finish_operation(
             operation_id,
-            status=status,
-            after_state=after_state,
-            result=failure_result,
+            status="failed_before_upstream",
+            after_state=None,
+            result=result,
             error_summary=safe_error,
-        )
-        _store().finish_preview(
-            token_hash, "consumed", operation_id=operation_id, result=failure_result
         )
         if isinstance(exc, PermissionError):
             raise PermissionError(safe_error) from None
         if isinstance(exc, ValueError):
             raise ValueError(safe_error) from None
         raise NetEaseError(safe_error) from None
+    return _execute_audited_write(
+        operation,
+        normalized,
+        plan,
+        user_id,
+        idempotency_key=idempotency_key,
+    )
 
 
 def available_tools() -> list[dict[str, Any]]:
@@ -2434,10 +2828,15 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         }
         if preview_token is not None:
             return _execute_previewed_operation(name, arguments, preview_token)
-        if REQUIRE_WRITE_PREVIEW or name in preview_only_tools:
+        policy = _effective_write_preview_policy()
+        if policy == "risk_based":
+            return _execute_risk_based_direct(name, arguments)
+        if policy == "strict" or name in preview_only_tools:
             raise ValueError(
                 "This write requires a matching preview_token. Call preview_operation with the same operation and arguments first."
             )
+        if policy != "legacy_direct":
+            raise ValueError("The configured write preview policy is invalid.")
     if name == "search_song":
         return search_song(arguments.get("query"), arguments.get("limit", 5))
     if name == "list_my_playlists":
@@ -2541,8 +2940,9 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "netease-music-mcp-safe", "version": "4.0.0"},
                 "instructions": (
-                    "Before every write, call preview_operation with the target tool name and arguments, "
-                    "review its before/after states, then call that same write tool with the returned preview_token. "
+                    "The server enforces its configured write preview policy. Under strict policy, call "
+                    "preview_operation before every write. Under risk_based policy, only documented low-risk "
+                    "writes may run once without a preview; all other writes still require preview_token. "
                     "Never reuse a preview for different arguments. Interaction notes are private plugin-owned data, "
                     "not native NetEase comments."
                 ),
@@ -3126,6 +3526,31 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_ACCESS_TOKEN before starting.")
     if MAX_REQUEST_BYTES < 1024:
         raise SystemExit("MCP_MAX_REQUEST_BYTES must be at least 1024.")
+    if WRITE_PREVIEW_POLICY_SOURCE == "MCP_WRITE_PREVIEW_POLICY" and WRITE_PREVIEW_POLICY not in {
+        "strict",
+        "risk_based",
+    }:
+        raise SystemExit("MCP_WRITE_PREVIEW_POLICY must be strict or risk_based.")
+    effective_policy = _effective_write_preview_policy()
+    if CONFIGURED_WRITE_PREVIEW_POLICY is not None and LEGACY_WRITE_PREVIEW_EXPLICIT:
+        legacy_policy = "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
+        if legacy_policy != effective_policy:
+            LOG.warning(
+                "Write preview configuration conflicts; using %s from MCP_WRITE_PREVIEW_POLICY "
+                "and ignoring MCP_REQUIRE_WRITE_PREVIEW.",
+                effective_policy,
+            )
+        else:
+            LOG.info(
+                "Write preview policy is %s; both configuration variables agree.",
+                effective_policy,
+            )
+    else:
+        LOG.info(
+            "Write preview policy is %s (source: %s).",
+            effective_policy,
+            WRITE_PREVIEW_POLICY_SOURCE,
+        )
     if not READ_ONLY and not STORAGE_PATH:
         raise SystemExit(
             "MCP_STORAGE_PATH is required in read-write mode. Point it to a SQLite file on a persistent volume."

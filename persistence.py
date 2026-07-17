@@ -35,6 +35,8 @@ def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
             result[key.removesuffix("_json")] = json.loads(raw) if raw else None
     if "reversible" in result:
         result["reversible"] = bool(result["reversible"])
+    if "upstream_action_started" in result:
+        result["upstream_action_started"] = bool(result["upstream_action_started"])
     return result
 
 
@@ -121,7 +123,9 @@ class PersistentStore:
                         undo_operation_id TEXT,
                         error_summary TEXT,
                         result_json TEXT,
-                        parent_operation_id TEXT
+                        parent_operation_id TEXT,
+                        upstream_action_started INTEGER NOT NULL DEFAULT 0,
+                        idempotency_key TEXT
                     );
                     CREATE INDEX IF NOT EXISTS operations_query_idx
                         ON operations(user_id, created_at DESC);
@@ -142,6 +146,30 @@ class PersistentStore:
                     CREATE INDEX IF NOT EXISTS notes_query_idx
                         ON interaction_notes(user_id, playlist_id, song_id, author, created_at);
                     """
+                )
+                operation_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(operations)")
+                }
+                if "upstream_action_started" not in operation_columns:
+                    connection.execute(
+                        "ALTER TABLE operations ADD COLUMN upstream_action_started "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                    # Older schemas could not distinguish a crash before or after a
+                    # mutating request. Treat their unfinished operations as having
+                    # crossed the boundary so cleanup conservatively reports unknown.
+                    connection.execute(
+                        "UPDATE operations SET upstream_action_started=1 "
+                        "WHERE status='started'"
+                    )
+                if "idempotency_key" not in operation_columns:
+                    connection.execute(
+                        "ALTER TABLE operations ADD COLUMN idempotency_key TEXT"
+                    )
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS operations_idempotency_idx "
+                    "ON operations(user_id, operation, idempotency_key) "
+                    "WHERE idempotency_key IS NOT NULL"
                 )
             self._initialized = True
 
@@ -175,7 +203,13 @@ class PersistentStore:
             connection.execute(
                 "UPDATE operations SET status='unknown', completed_at=?, "
                 "error_summary='Process stopped before the upstream result could be confirmed.' "
-                "WHERE status='started' AND created_at < ?",
+                "WHERE status='started' AND upstream_action_started=1 AND created_at < ?",
+                (utc_now(), interrupted_cutoff),
+            )
+            connection.execute(
+                "UPDATE operations SET status='failed_before_upstream', completed_at=?, "
+                "error_summary='Process stopped before any upstream write was sent.' "
+                "WHERE status='started' AND upstream_action_started=0 AND created_at < ?",
                 (utc_now(), interrupted_cutoff),
             )
             connection.execute(
@@ -291,29 +325,75 @@ class PersistentStore:
                 (status, operation_id, self._json(result), token_hash),
             )
 
-    def start_operation(self, record: dict[str, Any]) -> None:
+    def release_preview(self, token_hash: str, operation_id: str, result: Any) -> str:
+        """Return a claimed preview to pending when no mutating action began."""
+        self.initialize()
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT expires_at, status FROM previews WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+            if row is None or row["status"] != "executing":
+                return "unchanged"
+            status = "pending" if float(row["expires_at"]) >= now else "expired"
+            connection.execute(
+                "UPDATE previews SET status=?, operation_id=?, result_json=?, "
+                "artifact=CASE WHEN ?='pending' THEN artifact ELSE NULL END "
+                "WHERE token_hash=? AND status='executing'",
+                (status, operation_id, self._json(result), status, token_hash),
+            )
+            return status
+
+    def start_operation(self, record: dict[str, Any]) -> bool:
+        self.initialize()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO operations (
+                        operation_id, user_id, operation, sanitized_arguments_json,
+                        target_json, created_at, status, before_json, reversible,
+                        parent_operation_id, upstream_action_started, idempotency_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        record["operation_id"],
+                        str(record["user_id"]),
+                        record["operation"],
+                        self._json(record["sanitized_arguments"]),
+                        self._json(record.get("target")),
+                        record["created_at"],
+                        self._json(record.get("before_state")),
+                        int(bool(record["reversible"])),
+                        record.get("parent_operation_id"),
+                        record.get("idempotency_key"),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            if record.get("idempotency_key") is not None:
+                return False
+            raise
+        return True
+
+    def mark_upstream_action_started(self, operation_id: str) -> None:
         self.initialize()
         with self._connect() as connection:
             connection.execute(
-                """
-                INSERT INTO operations (
-                    operation_id, user_id, operation, sanitized_arguments_json,
-                    target_json, created_at, status, before_json, reversible,
-                    parent_operation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?, ?)
-                """,
-                (
-                    record["operation_id"],
-                    str(record["user_id"]),
-                    record["operation"],
-                    self._json(record["sanitized_arguments"]),
-                    self._json(record.get("target")),
-                    record["created_at"],
-                    self._json(record.get("before_state")),
-                    int(bool(record["reversible"])),
-                    record.get("parent_operation_id"),
-                ),
+                "UPDATE operations SET upstream_action_started=1 WHERE operation_id=?",
+                (operation_id,),
             )
+
+    def get_operation_by_idempotency(
+        self, user_id: int, operation: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM operations WHERE user_id=? AND operation=? "
+                "AND idempotency_key=?",
+                (str(user_id), operation, idempotency_key),
+            ).fetchone()
+        return _decode_row(row)
 
     def finish_operation(
         self,

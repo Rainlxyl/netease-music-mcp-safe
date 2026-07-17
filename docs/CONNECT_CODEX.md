@@ -37,10 +37,21 @@ must not be silently upgraded. The new authorization page will explicitly reques
 Also refresh, disconnect, and reconnect after deploying new tools or changing their input schema;
 otherwise ChatGPT may continue using a cached tool list from the previous deployment.
 
-For writes, ChatGPT should first call `preview_operation`, present the proposed before/after state,
-and call the selected write tool with the returned `preview_token`. Cover uploads use ChatGPT's
-top-level file parameter support; attach a PNG or JPEG instead of providing an image URL. If the new
-file field or preview tools do not appear, refresh the action definitions and reconnect again.
+With `MCP_WRITE_PREVIEW_POLICY=strict`, ChatGPT must first call `preview_operation`, present the
+proposed before/after state, and call the selected write tool with the returned `preview_token`.
+With `risk_based`, only an owned-playlist addition of at most 10 songs, `like_song(like=true)`, and
+validated private-note creation may run in one call. Every other write still follows the strict
+two-call flow.
+
+The three low-risk tools expose an optional `idempotency_key`. Codex can generate one stable UUID or
+other 8-100 character key for a single intended action and reuse it only when retrying that same
+action. ChatGPT's JSON-RPC request ID is not guaranteed to remain stable across a semantic retry, so
+the server cannot automatically deduplicate every client retry. Never reuse one key for a later
+intentional operation.
+
+Cover uploads use ChatGPT's top-level file parameter support; attach a PNG or JPEG instead of
+providing an image URL. If the new fields, preview tools, or updated descriptions do not appear,
+refresh the action definitions and reconnect again.
 
 Hosted Work cannot read an environment variable from the user's computer, so do not add a static
 `Authorization` header to a plugin manifest. The bearer-token configuration above remains available

@@ -27,6 +27,7 @@ Before enabling writes, attach a persistent volume mounted at `/data` and add:
 | Variable | Recommended value |
 | --- | --- |
 | `MCP_STORAGE_PATH` | `/data/netease-music-mcp.sqlite3` |
+| `MCP_WRITE_PREVIEW_POLICY` | `strict` |
 | `MCP_REQUIRE_WRITE_PREVIEW` | `true` |
 | `MCP_PREVIEW_TTL_SECONDS` | `300` |
 | `MCP_OPERATION_RETENTION_DAYS` | `90` |
@@ -64,7 +65,19 @@ tool.
 To enable write tools, confirm the persistent volume and database path first, then set
 `MCP_READ_ONLY=false`, redeploy, refresh the app's action definitions, and disconnect and reconnect
 the ChatGPT app to grant `netease.write` and reload the current tool schemas. Keep
-`MCP_REQUIRE_WRITE_PREVIEW=true`: ChatGPT must call `preview_operation`, show the proposed state,
-and pass its short-lived token to the matching write. Confirm that the authorization page lists the
-account changes before entering the private OAuth password. Do not approve write access if the page
-still describes the connection as read-only.
+`MCP_WRITE_PREVIEW_POLICY=strict` for the original behavior: ChatGPT must call
+`preview_operation`, show the proposed state, and pass its short-lived token to the matching write.
+The legacy `MCP_REQUIRE_WRITE_PREVIEW` is consulted only when the new variable is absent; if both
+are set, `MCP_WRITE_PREVIEW_POLICY` wins and a conflict is reported in startup logs without secrets.
+
+After strict mode has been verified, `MCP_WRITE_PREVIEW_POLICY=risk_based` may be used to permit
+only owned-playlist additions of at most 10 songs, likes (`like=true`), and validated private-note
+creation as single-call audited writes. All other writes still require preview. Do not set the
+legacy boolean to `false`; that selects the old unaudited compatibility behavior only when the new
+policy variable is absent.
+
+On the first deployment of this version, the existing SQLite database automatically gains
+`upstream_action_started`, a hashed idempotency-key column, and its partial unique index. Take a
+SQLite-consistent backup or volume snapshot before redeploying. Confirm that the authorization page
+lists the account changes before entering the private OAuth password. Do not approve write access if
+the page still describes the connection as read-only.
