@@ -78,6 +78,11 @@ READ_TOOL_NAMES = {
     "get_song_details",
     "get_play_history",
     "get_recent_plays",
+    "list_my_subscribed_podcasts",
+    "get_podcast_programs",
+    "search_podcasts",
+    "search_podcast_programs",
+    "get_recent_podcast_plays",
     "daily_recommend",
     "preview_operation",
     "get_operation_log",
@@ -179,6 +184,54 @@ READ_TOOLS = [
         "get_recent_plays",
         "Read actual recent song play events in upstream order, including per-play timestamps when NetEase supplies them. The upstream endpoint supports only a limit, not time-range or offset pagination.",
         {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}},
+    ),
+    _tool(
+        "list_my_subscribed_podcasts",
+        "List podcast/radio containers subscribed to by the logged-in user. Read-only. Public play counts are labelled as public aggregates, never as the user's listening count.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        },
+    ),
+    _tool(
+        "get_podcast_programs",
+        "Read one page of programs (episodes) from a podcast/radio container. Uses radio_id for the container and returns program_id plus an optional main_track_id audio carrier; it never calls either one song_id.",
+        {
+            "radio_id": {"type": "integer", "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "order": {
+                "type": "string",
+                "enum": ["newest", "oldest"],
+                "default": "newest",
+            },
+        },
+        ["radio_id"],
+    ),
+    _tool(
+        "search_podcasts",
+        "Search podcast/radio containers. Read-only; result IDs are radio_id values and public play counts are not personal listening counts.",
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 200},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        },
+        ["query"],
+    ),
+    _tool(
+        "search_podcast_programs",
+        "Search podcast programs/episodes. Read-only; result IDs are program_id values. An optional main_track_id identifies the audio carrier and is not a normal song resource ID.",
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 200},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        },
+        ["query"],
+    ),
+    _tool(
+        "get_recent_podcast_plays",
+        "Read the recent podcast-program resources reported by NetEase, preserving upstream order and timestamps only when supplied. This is not guaranteed to be a complete event stream and does not provide a reliable per-user play count.",
+        {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}},
     ),
     _tool("daily_recommend", "Get today's personalized song recommendations."),
     _tool(
@@ -963,6 +1016,327 @@ def get_recent_plays(limit: Any = 100) -> str:
                 "time_range_supported": False,
                 "offset_pagination_supported": False,
                 "completion_status_available": False,
+            },
+        }
+    )
+
+
+def _upstream_positive_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _upstream_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _clean_search_query(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 200:
+        raise ValueError("query must be between 1 and 200 characters.")
+    return value.strip()
+
+
+def _pagination_payload(
+    *, limit: int, offset: int, returned: int, total: Any, has_more: Any
+) -> dict[str, Any]:
+    normalized_total = _upstream_int(total)
+    normalized_more = has_more if isinstance(has_more, bool) else None
+    if normalized_more is None and normalized_total is not None:
+        normalized_more = offset + returned < normalized_total
+    return {
+        "returned": returned,
+        "limit": limit,
+        "offset": offset,
+        "upstream_total": normalized_total,
+        "has_next": normalized_more,
+        "next_offset": offset + returned if normalized_more is True else None,
+    }
+
+
+def _podcast_radio_payload(radio: dict[str, Any]) -> dict[str, Any]:
+    creator = radio.get("dj") if isinstance(radio.get("dj"), dict) else {}
+    create_time_ms = _upstream_int(radio.get("createTime"))
+    fee_scope = _upstream_int(radio.get("feeScope"))
+    return {
+        "resource_type": "podcast_radio",
+        "radio_id": _upstream_positive_id(radio.get("id")),
+        "name": radio.get("name"),
+        "description": radio.get("desc", radio.get("description")),
+        "cover_url": radio.get("picUrl", radio.get("coverUrl")),
+        "creator": {
+            "user_id": _upstream_positive_id(creator.get("userId")),
+            "nickname": creator.get("nickname"),
+        }
+        if creator
+        else None,
+        "category": radio.get("category"),
+        "second_category": radio.get("secondCategory"),
+        "program_count": _upstream_int(radio.get("programCount")),
+        "subscriber_count": _upstream_int(radio.get("subCount")),
+        "public_total_play_count": _upstream_int(radio.get("playCount")),
+        "public_count_semantics": (
+            "NetEase public aggregate; not the current user's listening count."
+        ),
+        "created_time_ms": create_time_ms,
+        "created_at": _milliseconds_to_iso8601(create_time_ms),
+        "is_paid": fee_scope != 0 if fee_scope is not None else None,
+    }
+
+
+def _podcast_program_payload(program: dict[str, Any]) -> dict[str, Any]:
+    radio = program.get("radio") if isinstance(program.get("radio"), dict) else {}
+    creator = program.get("dj") if isinstance(program.get("dj"), dict) else {}
+    main_song = program.get("mainSong") if isinstance(program.get("mainSong"), dict) else {}
+    main_track_id = _upstream_positive_id(program.get("mainTrackId"))
+    if main_track_id is None:
+        main_track_id = _upstream_positive_id(main_song.get("id"))
+    duration_ms = _upstream_int(program.get("duration"))
+    if duration_ms is None:
+        duration_ms = _upstream_int(main_song.get("duration"))
+    create_time_ms = _upstream_int(program.get("createTime"))
+    return {
+        "resource_type": "podcast_program",
+        "program_id": _upstream_positive_id(program.get("id")),
+        "radio_id": _upstream_positive_id(radio.get("id", program.get("radioId"))),
+        "main_track_id": main_track_id,
+        "main_track_semantics": (
+            "Audio carrier returned by NetEase; it is not exposed as a normal song_id."
+            if main_track_id is not None
+            else None
+        ),
+        "name": program.get("name"),
+        "description": program.get("description", program.get("desc")),
+        "cover_url": program.get("coverUrl", program.get("blurCoverUrl")),
+        "radio_name": radio.get("name"),
+        "creator": {
+            "user_id": _upstream_positive_id(creator.get("userId")),
+            "nickname": creator.get("nickname"),
+        }
+        if creator
+        else None,
+        "duration_ms": duration_ms,
+        "duration_seconds": round(duration_ms / 1000, 3) if duration_ms is not None else None,
+        "published_time_ms": create_time_ms,
+        "published_at": _milliseconds_to_iso8601(create_time_ms),
+        "serial_number": _upstream_int(program.get("serialNum")),
+        "program_type": program.get("type"),
+        "public_listener_count": _upstream_int(program.get("listenerCount")),
+        "public_liked_count": _upstream_int(program.get("likedCount")),
+        "public_comment_count": _upstream_int(program.get("commentCount")),
+        "public_share_count": _upstream_int(program.get("shareCount")),
+        "public_count_semantics": (
+            "NetEase public aggregates; none are the current user's personal play count."
+        ),
+    }
+
+
+def list_my_subscribed_podcasts(limit: Any = 30, offset: Any = 0) -> str:
+    limit = _bounded_int(limit, "limit", 1, 100)
+    offset = _non_negative_int(offset, "offset")
+    response = netease_request(
+        "https://music.163.com/api/djradio/get/subed",
+        data={"limit": str(limit), "offset": str(offset), "total": "true"},
+    )
+    _raise_for_upstream_code(response, "Subscribed podcast lookup failed.")
+    radios = response.get("djRadios")
+    if not isinstance(radios, list):
+        radios = []
+    normalized = [_podcast_radio_payload(item) for item in radios if isinstance(item, dict)]
+    return _json_text(
+        {
+            "record_type": "subscribed_podcast_radio_page",
+            "pagination": _pagination_payload(
+                limit=limit,
+                offset=offset,
+                returned=len(normalized),
+                total=response.get("count", response.get("total")),
+                has_more=response.get("hasMore", response.get("more")),
+            ),
+            "podcasts": normalized,
+        }
+    )
+
+
+def get_podcast_programs(
+    radio_id: Any, limit: Any = 30, offset: Any = 0, order: Any = "newest"
+) -> str:
+    radio_id = _positive_int(radio_id, "radio_id")
+    limit = _bounded_int(limit, "limit", 1, 100)
+    offset = _non_negative_int(offset, "offset")
+    if order not in ("newest", "oldest"):
+        raise ValueError("order must be 'newest' or 'oldest'.")
+    response = netease_request(
+        "https://music.163.com/api/dj/program/byradio",
+        data={
+            "radioId": str(radio_id),
+            "limit": str(limit),
+            "offset": str(offset),
+            "asc": "true" if order == "oldest" else "false",
+        },
+    )
+    _raise_for_upstream_code(response, "Podcast program lookup failed.")
+    programs = response.get("programs")
+    if not isinstance(programs, list):
+        programs = []
+    normalized = [_podcast_program_payload(item) for item in programs if isinstance(item, dict)]
+    return _json_text(
+        {
+            "record_type": "podcast_program_page",
+            "radio_id": radio_id,
+            "order": order,
+            "pagination": _pagination_payload(
+                limit=limit,
+                offset=offset,
+                returned=len(normalized),
+                total=response.get("count"),
+                has_more=response.get("more", response.get("hasMore")),
+            ),
+            "programs": normalized,
+        }
+    )
+
+
+def _search_resources(response: dict[str, Any], legacy_key: str) -> tuple[list[Any], Any, Any]:
+    data = response.get("data")
+    if isinstance(data, dict) and isinstance(data.get("resources"), list):
+        return data["resources"], data.get("totalCount"), data.get("hasMore")
+    result = response.get("result")
+    if isinstance(result, dict) and isinstance(result.get(legacy_key), list):
+        return result[legacy_key], result.get(f"{legacy_key}Count"), result.get("hasMore")
+    return [], None, None
+
+
+def search_podcasts(query: Any, limit: Any = 20, offset: Any = 0) -> str:
+    query = _clean_search_query(query)
+    limit = _bounded_int(limit, "limit", 1, 50)
+    offset = _non_negative_int(offset, "offset")
+    response = netease_request(
+        "https://music.163.com/api/search/voicelist/get",
+        data={
+            "keyword": query,
+            "scene": "normal",
+            "limit": str(limit),
+            "offset": str(offset),
+            "e_r": "true",
+        },
+    )
+    _raise_for_upstream_code(response, "Podcast search failed.")
+    resources, total, has_more = _search_resources(response, "djRadios")
+    radios = []
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        base = resource.get("baseInfo") if isinstance(resource.get("baseInfo"), dict) else resource
+        radios.append(_podcast_radio_payload(base))
+    return _json_text(
+        {
+            "record_type": "podcast_radio_search_page",
+            "query": query,
+            "pagination": _pagination_payload(
+                limit=limit, offset=offset, returned=len(radios), total=total, has_more=has_more
+            ),
+            "podcasts": radios,
+        }
+    )
+
+
+def search_podcast_programs(query: Any, limit: Any = 20, offset: Any = 0) -> str:
+    query = _clean_search_query(query)
+    limit = _bounded_int(limit, "limit", 1, 50)
+    offset = _non_negative_int(offset, "offset")
+    response = netease_request(
+        "https://music.163.com/api/search/voice/get",
+        data={
+            "keyword": query,
+            "scene": "normal",
+            "limit": str(limit),
+            "offset": str(offset),
+        },
+    )
+    _raise_for_upstream_code(response, "Podcast program search failed.")
+    resources, total, has_more = _search_resources(response, "djprograms")
+    programs = []
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        base = resource.get("baseInfo") if isinstance(resource.get("baseInfo"), dict) else resource
+        program = _podcast_program_payload(base)
+        if program["program_id"] is None:
+            program["program_id"] = _upstream_positive_id(resource.get("resourceId"))
+        programs.append(program)
+    return _json_text(
+        {
+            "record_type": "podcast_program_search_page",
+            "query": query,
+            "pagination": _pagination_payload(
+                limit=limit,
+                offset=offset,
+                returned=len(programs),
+                total=total,
+                has_more=has_more,
+            ),
+            "programs": programs,
+        }
+    )
+
+
+def get_recent_podcast_plays(limit: Any = 50) -> str:
+    limit = _bounded_int(limit, "limit", 1, 100)
+    response = netease_request(
+        "https://music.163.com/api/play-record/voice/list",
+        data={"limit": str(limit)},
+    )
+    _raise_for_upstream_code(response, "Recent podcast play lookup failed.")
+    data = response.get("data")
+    entries = data.get("list") if isinstance(data, dict) else None
+    response_shape = "recent_program_resource_list" if isinstance(entries, list) else "unsupported"
+    if not isinstance(entries, list):
+        entries = []
+    records = []
+    for entry in entries[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        raw_program = entry.get("data")
+        if not isinstance(raw_program, dict):
+            raw_program = entry.get("baseInfo") if isinstance(entry.get("baseInfo"), dict) else {}
+        program = _podcast_program_payload(raw_program)
+        if program["program_id"] is None:
+            program["program_id"] = _upstream_positive_id(entry.get("resourceId"))
+        play_time_ms = _upstream_int(entry.get("playTime"))
+        terminal = entry.get("multiTerminalInfo")
+        if not isinstance(terminal, dict):
+            terminal = {}
+        records.append(
+            {
+                **program,
+                "play_time_ms": play_time_ms,
+                "played_at": _milliseconds_to_iso8601(play_time_ms),
+                "source_device": terminal.get("osText"),
+            }
+        )
+    raw_total = data.get("total") if isinstance(data, dict) else None
+    return _json_text(
+        {
+            "record_type": "recent_podcast_program_resources",
+            "response_shape": response_shape,
+            "order": "upstream_order_preserved",
+            "returned": len(records),
+            "upstream_total": _upstream_int(raw_total),
+            "limit": limit,
+            "records": records,
+            "personal_play_count_supported": False,
+            "limitations": {
+                "complete_event_stream_guaranteed": False,
+                "time_range_supported": False,
+                "offset_pagination_supported": False,
+                "personal_program_play_count_available": False,
+                "public_listener_count_is_personal": False,
             },
         }
     )
@@ -2086,6 +2460,31 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         return get_play_history(arguments.get("limit", 30), arguments.get("all_time", False))
     if name == "get_recent_plays":
         return get_recent_plays(arguments.get("limit", 100))
+    if name == "list_my_subscribed_podcasts":
+        return list_my_subscribed_podcasts(
+            arguments.get("limit", 30), arguments.get("offset", 0)
+        )
+    if name == "get_podcast_programs":
+        return get_podcast_programs(
+            arguments.get("radio_id"),
+            arguments.get("limit", 30),
+            arguments.get("offset", 0),
+            arguments.get("order", "newest"),
+        )
+    if name == "search_podcasts":
+        return search_podcasts(
+            arguments.get("query"),
+            arguments.get("limit", 20),
+            arguments.get("offset", 0),
+        )
+    if name == "search_podcast_programs":
+        return search_podcast_programs(
+            arguments.get("query"),
+            arguments.get("limit", 20),
+            arguments.get("offset", 0),
+        )
+    if name == "get_recent_podcast_plays":
+        return get_recent_podcast_plays(arguments.get("limit", 50))
     if name == "daily_recommend":
         return daily_recommend()
     if name == "preview_operation":

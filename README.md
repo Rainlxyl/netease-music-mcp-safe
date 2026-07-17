@@ -36,6 +36,13 @@ Read-only mode provides:
   per-song play ranking. These are counts, not individual listening events.
 - `get_recent_plays(limit=100)`: return the upstream recent-song event list without reordering it,
   with raw millisecond and ISO 8601 timestamps when available.
+- `list_my_subscribed_podcasts(limit=30, offset=0)`: list subscribed podcast/radio containers.
+- `get_podcast_programs(radio_id, limit=30, offset=0, order="newest")`: list programs/episodes in
+  one podcast container. `order` may be `newest` or `oldest`.
+- `search_podcasts(query, limit=20, offset=0)`: search podcast/radio containers.
+- `search_podcast_programs(query, limit=20, offset=0)`: search programs/episodes.
+- `get_recent_podcast_plays(limit=50)`: return recent podcast-program resources in upstream order,
+  with a timestamp only when NetEase supplies one. It is not presented as a complete event stream.
 - `daily_recommend()`: read personalized daily recommendations.
 - `preview_operation(operation, arguments)`: read the current state and proposed state without
   modifying anything, then issue a short-lived token bound to that exact operation and state.
@@ -48,6 +55,44 @@ Read-write mode additionally provides `create_playlist`, `update_playlist`, `add
 `remove_from_playlist`, `reorder_playlist_tracks`, `like_song`, `undo_operation`,
 `update_playlist_cover`, `create_interaction_note`, `update_interaction_note`, and
 `delete_interaction_note`.
+
+### Experimental podcast read-only dry run
+
+The five podcast tools above are an experimental, read-only dry-run surface. Their request and
+response handling is covered by synthetic fixtures with every network call mocked; this version has
+not read a real account. Before publishing it, test the authenticated response shapes with a
+non-sensitive account and review the normalized output. No podcast write action is included.
+
+NetEase uses several related but distinct objects. This server keeps their identifiers separate:
+
+- `radio_id` identifies the podcast/radio container (called `djRadio` or `voicelist` upstream);
+- `program_id` identifies a program/episode (called `program` or `voice` upstream);
+- `main_track_id`, when present, is NetEase's audio carrier for that program. It is deliberately not
+  returned as `song_id`, because a podcast program is not a normal song resource.
+
+Example page request:
+
+```json
+{
+  "name": "get_podcast_programs",
+  "arguments": {"radio_id": 123456, "limit": 20, "offset": 20, "order": "newest"}
+}
+```
+
+`radio.playCount` and `program.listenerCount` are normalized as
+`public_total_play_count` and `public_listener_count`. They are public aggregates, not the current
+user's personal listening count. The investigated upstream API does not expose a reliable count of
+how many times the current user played one program, so this server does not provide or infer one.
+
+The recent-program endpoint accepts only `limit` in the investigated implementation. It does not
+offer offset or time-range paging and is not documented as a complete per-play event ledger. The
+server preserves the upstream order, emits `played_at` only from an actual `playTime`, and returns
+`personal_play_count_supported: false`. An unrecognized or aggregate-only response produces no fake
+events. The container-level recent-radio endpoint was investigated but is not exposed because it is
+less precise than the program-level endpoint.
+
+After deploying this version, refresh the app's action definitions and disconnect/reconnect the
+ChatGPT app before expecting the new podcast tool schemas to appear.
 
 ### Preview, execute, audit, and undo
 
@@ -245,6 +290,11 @@ Song detail and version fields are limited to metadata actually returned by NetE
 may omit device, completion state, or timestamps when the upstream omits them. Playlist paging and
 safe reordering require the complete `trackIds` list; the server refuses to guess when that list is
 incomplete. The reorder endpoint is undocumented and may stop working if NetEase changes it.
+
+Podcast/radio interfaces are likewise undocumented. Subscription listing requires an authenticated
+NetEase session. Search and public program metadata can expose public aggregate play/listener counts,
+but the investigated upstream data does not provide a reliable current-user per-program play count.
+Recent podcast resources may omit timestamps and are not guaranteed to represent every play event.
 
 Cover upload and cover update are also undocumented NetEase web interfaces. The project cannot
 guarantee restoration of an overwritten cover or distinguish every upstream partial-success case.

@@ -261,6 +261,186 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(payload["aggregated_tracks"][0]["play_count"], 7)
         self.assertNotIn("played_at", payload["aggregated_tracks"][0])
 
+    def test_podcast_tool_schemas_keep_radio_and_program_ids_distinct(self):
+        module = load_server("true")
+        tools = {tool["name"]: tool for tool in module.available_tools()}
+        expected = {
+            "list_my_subscribed_podcasts",
+            "get_podcast_programs",
+            "search_podcasts",
+            "search_podcast_programs",
+            "get_recent_podcast_plays",
+        }
+        self.assertTrue(expected.issubset(tools))
+        for name in expected:
+            self.assertTrue(tools[name]["annotations"]["readOnlyHint"])
+            self.assertNotIn("song_id", tools[name]["inputSchema"]["properties"])
+        self.assertIn("radio_id", tools["get_podcast_programs"]["inputSchema"]["properties"])
+
+    def test_list_subscribed_podcasts_uses_pagination_and_public_count_labels(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "count": 4,
+            "hasMore": True,
+            "djRadios": [
+                {
+                    "id": 101,
+                    "name": "Signals",
+                    "desc": "Interviews",
+                    "playCount": 999,
+                    "subCount": 8,
+                    "programCount": 12,
+                    "dj": {"userId": 7, "nickname": "Host"},
+                }
+            ],
+        }
+        with mock.patch.object(module, "netease_request", return_value=response) as request:
+            payload = json.loads(module.list_my_subscribed_podcasts(1, 2))
+        self.assertEqual(payload["podcasts"][0]["radio_id"], 101)
+        self.assertEqual(payload["podcasts"][0]["public_total_play_count"], 999)
+        self.assertNotIn("personal_play_count", payload["podcasts"][0])
+        self.assertEqual(payload["pagination"]["next_offset"], 3)
+        self.assertEqual(
+            request.call_args.kwargs["data"],
+            {"limit": "1", "offset": "2", "total": "true"},
+        )
+
+    def test_get_podcast_programs_normalizes_ids_and_order(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "count": 1,
+            "more": False,
+            "programs": [
+                {
+                    "id": 501,
+                    "name": "Episode one",
+                    "radio": {"id": 101, "name": "Signals"},
+                    "mainTrackId": 9001,
+                    "duration": 123000,
+                    "createTime": 2000,
+                    "listenerCount": 77,
+                }
+            ],
+        }
+        with mock.patch.object(module, "netease_request", return_value=response) as request:
+            payload = json.loads(module.get_podcast_programs(101, order="oldest"))
+        program = payload["programs"][0]
+        self.assertEqual(program["program_id"], 501)
+        self.assertEqual(program["radio_id"], 101)
+        self.assertEqual(program["main_track_id"], 9001)
+        self.assertNotIn("song_id", program)
+        self.assertEqual(program["public_listener_count"], 77)
+        self.assertEqual(request.call_args.kwargs["data"]["asc"], "true")
+
+    def test_search_podcasts_and_programs_parse_current_resource_shape(self):
+        module = load_server("true")
+        radio_response = {
+            "code": 200,
+            "data": {
+                "totalCount": 1,
+                "hasMore": False,
+                "resources": [
+                    {"resourceType": "voicelist", "resourceId": "101", "baseInfo": {"id": 101, "name": "Radio"}}
+                ],
+            },
+        }
+        program_response = {
+            "code": 200,
+            "data": {
+                "totalCount": 1,
+                "hasMore": False,
+                "resources": [
+                    {
+                        "resourceType": "voice",
+                        "resourceId": "501",
+                        "baseInfo": {"name": "Episode", "radio": {"id": 101}},
+                    }
+                ],
+            },
+        }
+        with mock.patch.object(
+            module, "netease_request", side_effect=[radio_response, program_response]
+        ) as request:
+            radios = json.loads(module.search_podcasts("  ambient  "))
+            programs = json.loads(module.search_podcast_programs("ambient"))
+        self.assertEqual(radios["query"], "ambient")
+        self.assertEqual(radios["podcasts"][0]["radio_id"], 101)
+        self.assertEqual(programs["programs"][0]["program_id"], 501)
+        self.assertNotIn("song_id", programs["programs"][0])
+        self.assertIn("/api/search/voicelist/get", request.call_args_list[0].args[0])
+        self.assertIn("/api/search/voice/get", request.call_args_list[1].args[0])
+
+    def test_recent_podcast_plays_preserve_order_without_faking_timestamps_or_counts(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "data": {
+                "total": 2,
+                "list": [
+                    {
+                        "resourceId": "502",
+                        "playTime": 2000,
+                        "data": {"id": 502, "name": "New", "radio": {"id": 101}},
+                        "multiTerminalInfo": {"osText": "Web"},
+                    },
+                    {
+                        "resourceId": "501",
+                        "data": {
+                            "id": 501,
+                            "name": "Old",
+                            "radio": {"id": 101},
+                            "listenerCount": 88,
+                        },
+                    },
+                ],
+            },
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_recent_podcast_plays(2))
+        self.assertEqual([item["program_id"] for item in payload["records"]], [502, 501])
+        self.assertEqual(payload["records"][0]["played_at"], "1970-01-01T00:00:02Z")
+        self.assertIsNone(payload["records"][1]["played_at"])
+        self.assertEqual(payload["records"][1]["public_listener_count"], 88)
+        self.assertFalse(payload["personal_play_count_supported"])
+        self.assertFalse(payload["limitations"]["complete_event_stream_guaranteed"])
+
+    def test_recent_podcast_plays_rejects_unknown_shape_instead_of_faking_events(self):
+        module = load_server("true")
+        response = {"code": 200, "weekData": [{"listenerCount": 900}]}
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_recent_podcast_plays())
+        self.assertEqual(payload["response_shape"], "unsupported")
+        self.assertEqual(payload["records"], [])
+        self.assertFalse(payload["personal_play_count_supported"])
+
+    def test_podcast_tools_validate_before_network_calls(self):
+        module = load_server("true")
+        calls = [
+            lambda: module.list_my_subscribed_podcasts(0, 0),
+            lambda: module.list_my_subscribed_podcasts(1, -1),
+            lambda: module.get_podcast_programs(0),
+            lambda: module.get_podcast_programs(1, order="random"),
+            lambda: module.search_podcasts(" "),
+            lambda: module.search_podcast_programs("x", limit=51),
+            lambda: module.get_recent_podcast_plays(True),
+        ]
+        with mock.patch.object(module, "netease_request") as request:
+            for call in calls:
+                with self.subTest(call=call), self.assertRaises(ValueError):
+                    call()
+        request.assert_not_called()
+
+    def test_podcast_upstream_failure_is_redacted(self):
+        module = load_server("true")
+        response = {"code": 500, "message": "failed for " + module.NETEASE_COOKIE}
+        with mock.patch.object(module, "netease_request", return_value=response):
+            with self.assertRaises(module.NetEaseError) as context:
+                module.search_podcasts("ambient")
+        self.assertNotIn("MUSIC_U=test", str(context.exception))
+        self.assertIn("[REDACTED]", str(context.exception))
+
     def test_upstream_failure_is_redacted(self):
         module = load_server("true")
         response = {"code": 500, "message": "failed for " + module.NETEASE_COOKIE}
