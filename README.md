@@ -16,7 +16,7 @@ Cloud Music account. It is derived from
 - Streamable HTTP runs statelessly and does not advertise a session or SSE stream that the server cannot maintain.
 - Cookies are read only from environment variables and are never returned by `/health`.
 - Destructive tools are clearly identified and require `MCP_READ_ONLY=false`.
-- Production writes use a short-lived, state-bound preview token and a bounded persistent audit log.
+- Production writes run in one call while retaining ownership checks, state verification, idempotency, and a bounded persistent audit log.
 - Private interaction notes and audit records are isolated by the current NetEase user ID.
 
 ## Available tools
@@ -44,8 +44,6 @@ Read-only mode provides:
 - `get_recent_podcast_plays(limit=50)`: return recent podcast-program resources in upstream order,
   with a timestamp only when NetEase supplies one. It is not presented as a complete event stream.
 - `daily_recommend()`: read personalized daily recommendations.
-- `preview_operation(operation, arguments)`: read the current state and proposed state without
-  modifying anything, then issue a short-lived token bound to that exact operation and state.
 - `get_operation_log(...)`: read sanitized, bounded audit records with pagination and optional
   operation, status, and ISO 8601 time filters.
 - `list_interaction_notes(playlist_id, song_id?, author?, limit=50, offset=0)`: read private
@@ -94,56 +92,19 @@ less precise than the program-level endpoint.
 After deploying this version, refresh the app's action definitions and disconnect/reconnect the
 ChatGPT app before expecting the new podcast tool schemas to appear.
 
-### Strict and risk-based write policies
+### Single-call audited writes
 
-`MCP_WRITE_PREVIEW_POLICY` accepts `strict` or `risk_based` and defaults to `strict`. Under
-`strict`, the safe production flow is always two calls. First preview the intended write:
+Every write tool executes in one MCP call after validating its business arguments, current user,
+resource ownership or access, and relevant current state. `preview_operation` is no longer exposed,
+and public write schemas do not contain `preview_token`. For temporary client compatibility, an old
+client may still send `preview_token`; the server ignores it and never logs its value.
 
-```json
-{
-  "name": "preview_operation",
-  "arguments": {
-    "operation": "update_playlist",
-    "arguments": {"playlist_id": 123456, "name": "Night Signals"}
-  }
-}
-```
+The removed approval flow does not remove backend safeguards. Every write uses the same execution
+core for before/after snapshots, `upstream_action_started`, post-write verification, sanitized audit
+records, undo state, and `success`, `failed_before_upstream`, `failed`, `partial_success`, or
+`unknown` classification. Partial and unknown results are never retried automatically.
 
-After reviewing `before_state`, `expected_after_state`, risk, and reversibility, call the original
-tool with exactly the same arguments plus the returned token:
-
-```json
-{
-  "name": "update_playlist",
-  "arguments": {
-    "playlist_id": 123456,
-    "name": "Night Signals",
-    "preview_token": "RETURNED_SHORT_LIVED_TOKEN"
-  }
-}
-```
-
-Tokens expire after five minutes by default, are stored only as SHA-256 hashes, are single-use,
-and are bound to the NetEase user, operation, normalized arguments, and resource-state hash. A
-duplicate request with an already successful token returns the recorded result instead of writing
-again. If the playlist, like state, note version, or target permission changes after preview, the
-write is rejected as a conflict. A process interruption leaves an old in-progress record as
-`unknown`; it is never retried automatically because the upstream result may be ambiguous.
-
-Under `risk_based`, only these validated low-risk writes may run in one call without a preview:
-
-- `add_to_playlist` for a playlist owned by the current user, with 1-10 unique song IDs;
-- `like_song` with `like=true`;
-- `create_interaction_note` with `visibility=private`, an accessible playlist, and an optional
-  `song_id` that is currently in that playlist.
-
-Eleven or more additions are never split automatically. Unlikes, removals, reorders, playlist
-creation or metadata changes, note updates/deletes, undo, cover updates, and every operation that
-does not meet the low-risk conditions still require a matching preview token. All risk-based direct
-writes use the same ownership checks, before/after snapshots, audit records, undo state, redaction,
-and partial/unknown-result handling as previewed writes.
-
-The three low-risk tools accept an optional `idempotency_key` containing 8-100 ASCII letters,
+All write tools accept an optional `idempotency_key` containing 8-100 ASCII letters,
 digits, dots, underscores, colons, or hyphens. The raw key is never stored; SQLite stores its
 SHA-256 digest under a unique `(user_id, operation, idempotency_key)` constraint. Reusing the key
 returns the recorded success or error without another write. A different key permits a later
@@ -154,27 +115,22 @@ so the server does not treat it as a durable automatic idempotency key.
 Every audited write records sanitized arguments, target, timestamps, before/after state, status,
 reversibility, undo state, `upstream_action_started`, and a redacted error summary.
 `failed_before_upstream` means no mutating request was sent; `unknown` means a mutating request was
-sent but its result could not be confirmed, and it is never automatically retried. A preview that
-fails before the action boundary returns to `pending` until its original expiry time.
+sent but its result could not be confirmed, and it is never automatically retried.
 `get_operation_log` supports `limit`,
 `offset`, `operation`, `status`, `created_after`, and `created_before`. Logs are retained for at
 most 90 days and 1,000 records by default.
 
-Compatibility precedence is explicit:
-
-1. If `MCP_WRITE_PREVIEW_POLICY` is set, it wins and must be `strict` or `risk_based`.
-2. If it is absent, `MCP_REQUIRE_WRITE_PREVIEW=true` maps to `strict`.
-3. If it is absent and the legacy variable is `false`, the old unaudited direct-write behavior is
-   retained only for compatibility and must not be used in production.
-4. If both variables conflict, startup logs the final policy and that the legacy variable was
-   ignored; no credential or other secret is logged.
+`MCP_WRITE_PREVIEW_POLICY`, `MCP_REQUIRE_WRITE_PREVIEW`, `MCP_PREVIEW_TTL_SECONDS`, and
+`MCP_MAX_PENDING_PREVIEWS` are deprecated and do not change runtime behavior. If they remain in an
+old deployment, startup logs only their variable names and ignores their values. Remove them after
+deploying this version.
 
 Existing SQLite files migrate automatically by adding the action-boundary and hashed-idempotency
 columns plus a partial unique index. Back up the persistent volume before deployment as usual.
 
-`undo_operation` itself must be previewed. It permits only a successful record marked reversible,
-checks that the recorded after-state is still current, writes its own audit record, and refuses a
-second undo. Supported restoration paths are:
+`undo_operation(operation_id)` runs directly, but still permits only a successful record marked
+reversible, checks that the recorded after-state is current, writes its own audit record, and
+refuses a second undo. Supported restoration paths are:
 
 - playlist name and description;
 - tracks added by one operation;
@@ -222,7 +178,8 @@ by deleting and re-adding tracks. For request-size safety, at most 10,000 IDs ar
 
 ### Updating a playlist cover
 
-`update_playlist_cover(playlist_id, image, preview_token)` is a high-risk write for owned playlists.
+`update_playlist_cover(playlist_id, image)` directly replaces the cover of an owned playlist after
+the image and ownership checks pass.
 In ChatGPT, attach a PNG or JPEG as the `image` file parameter; the tool declares the top-level file
 field through `_meta["openai/fileParams"]` as described in the
 [official Apps SDK file-handling guide](https://developers.openai.com/apps-sdk/build/mcp-server#file-handling).
@@ -234,7 +191,7 @@ The input defaults to a 5 MiB compressed-size limit and 25 million pixels. MIME 
 and decoded image format must agree. The server decodes the image with Pillow, applies EXIF
 orientation, center-crops it to a square, resizes it to 300x300, converts it to JPEG, and writes a
 new image without EXIF or other source metadata. Processing is in memory; no upload temporary file
-is created. The processed preview image is removed from SQLite after execution or expiry.
+or persisted approval artifact is created.
 
 NetEase's undocumented flow allocates a short-lived NOS upload credential, uploads the JPEG, then
 updates the owned playlist cover. The NOS credential and ChatGPT download URL are never logged.
@@ -291,20 +248,18 @@ Set the following environment variables in Zeabur's dashboard, never in Git:
 - `MCP_PUBLIC_URL`: public HTTPS origin, for example `https://YOUR-SERVICE.zeabur.app`
 - `MCP_OAUTH_PASSWORD`: a separate random password of at least 16 characters for one-time browser authorization
 - `MCP_STORAGE_PATH`: for example `/data/netease-music-mcp.sqlite3` on a mounted persistent volume
-- `MCP_WRITE_PREVIEW_POLICY`: `strict` (default) or `risk_based`
 
 The MCP endpoint will be `https://YOUR-SERVICE.zeabur.app/mcp`.
 
 ### Optional write mode
 
-After all read tools have been tested, mount a persistent volume at `/data`, set
-`MCP_WRITE_PREVIEW_POLICY=strict` for the original two-step flow or explicitly choose
-`risk_based`, and set `MCP_READ_ONLY=false` to expose account and private-note writes. Keep the
-legacy `MCP_REQUIRE_WRITE_PREVIEW=true` while migrating; the new variable takes precedence. The
-OAuth page then shows a separate write-access warning and requires explicit
-confirmation. Keep ChatGPT's write-action confirmations enabled while testing. Use one service
-instance per SQLite file; horizontal multi-writer deployment requires a database backend that this
-version does not yet provide.
+After all read tools have been tested, mount a persistent volume at `/data` and set
+`MCP_READ_ONLY=false` to expose account and private-note writes. Each write then executes in one
+tool call while backend validation, auditing, status verification, and optional idempotency remain
+active. Remove the deprecated `MCP_WRITE_PREVIEW_POLICY`, `MCP_REQUIRE_WRITE_PREVIEW`,
+`MCP_PREVIEW_TTL_SECONDS`, and `MCP_MAX_PENDING_PREVIEWS` variables. Use one service instance per
+SQLite file; horizontal multi-writer deployment requires a database backend that this version does
+not yet provide.
 
 After deploying a version with new or changed tools, refresh the app's action definitions, then
 disconnect and reconnect the ChatGPT app so it reloads the tool schema and obtains the current

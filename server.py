@@ -51,25 +51,18 @@ MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
 STORAGE_PATH = os.environ.get("MCP_STORAGE_PATH", "").strip()
-LEGACY_WRITE_PREVIEW_EXPLICIT = "MCP_REQUIRE_WRITE_PREVIEW" in os.environ
-LEGACY_WRITE_PREVIEW_RAW = os.environ.get("MCP_REQUIRE_WRITE_PREVIEW", "true").strip().lower()
-REQUIRE_WRITE_PREVIEW = LEGACY_WRITE_PREVIEW_RAW not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-CONFIGURED_WRITE_PREVIEW_POLICY = os.environ.get("MCP_WRITE_PREVIEW_POLICY")
-if CONFIGURED_WRITE_PREVIEW_POLICY is None:
-    WRITE_PREVIEW_POLICY = "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
-    WRITE_PREVIEW_POLICY_SOURCE = "MCP_REQUIRE_WRITE_PREVIEW"
-else:
-    WRITE_PREVIEW_POLICY = CONFIGURED_WRITE_PREVIEW_POLICY.strip().lower()
-    WRITE_PREVIEW_POLICY_SOURCE = "MCP_WRITE_PREVIEW_POLICY"
-PREVIEW_TTL_SECONDS = int(os.environ.get("MCP_PREVIEW_TTL_SECONDS", "300"))
+DEPRECATED_WRITE_PREVIEW_VARS = tuple(
+    name
+    for name in (
+        "MCP_WRITE_PREVIEW_POLICY",
+        "MCP_REQUIRE_WRITE_PREVIEW",
+        "MCP_PREVIEW_TTL_SECONDS",
+        "MCP_MAX_PENDING_PREVIEWS",
+    )
+    if name in os.environ
+)
 OPERATION_RETENTION_DAYS = int(os.environ.get("MCP_OPERATION_RETENTION_DAYS", "90"))
 MAX_OPERATION_LOGS = int(os.environ.get("MCP_MAX_OPERATION_LOGS", "1000"))
-MAX_PENDING_PREVIEWS = int(os.environ.get("MCP_MAX_PENDING_PREVIEWS", "200"))
 MAX_IMAGE_BYTES = int(os.environ.get("MCP_MAX_IMAGE_BYTES", "5242880"))
 MAX_IMAGE_PIXELS = int(os.environ.get("MCP_MAX_IMAGE_PIXELS", "25000000"))
 OAUTH_SCOPE = "netease.read" if READ_ONLY else "netease.read netease.write"
@@ -80,11 +73,6 @@ FAILED_LOGINS_LOCK = threading.Lock()
 STORE_INSTANCE: PersistentStore | None = None
 STORE_LOCK = threading.Lock()
 
-
-def _effective_write_preview_policy() -> str:
-    if WRITE_PREVIEW_POLICY_SOURCE == "MCP_REQUIRE_WRITE_PREVIEW":
-        return "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
-    return WRITE_PREVIEW_POLICY
 
 READ_TOOL_NAMES = {
     "search_song",
@@ -99,7 +87,6 @@ READ_TOOL_NAMES = {
     "search_podcast_programs",
     "get_recent_podcast_plays",
     "daily_recommend",
-    "preview_operation",
     "get_operation_log",
     "list_interaction_notes",
 }
@@ -150,6 +137,15 @@ def _tool(
     if meta:
         result["_meta"] = meta
     return result
+
+
+def _idempotency_schema() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "minLength": 8,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9._:-]+$",
+    }
 
 
 READ_TOOLS = [
@@ -250,15 +246,6 @@ READ_TOOLS = [
     ),
     _tool("daily_recommend", "Get today's personalized song recommendations."),
     _tool(
-        "preview_operation",
-        "Read-only preview for an account or private-note write. It never changes data and returns a short-lived token bound to the arguments and current resource state.",
-        {
-            "operation": {"type": "string", "enum": sorted(WRITE_TOOL_NAMES)},
-            "arguments": {"type": "object", "additionalProperties": True},
-        },
-        ["operation", "arguments"],
-    ),
-    _tool(
         "get_operation_log",
         "Read sanitized, bounded operation audit records from persistent storage.",
         {
@@ -292,7 +279,7 @@ WRITE_TOOLS = [
             "name": {"type": "string", "minLength": 1, "maxLength": 80},
             "description": {"type": "string", "maxLength": 1000},
             "privacy": {"type": "integer", "enum": [0, 10], "default": 10},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
         ["name"],
         read_only=False,
@@ -304,7 +291,7 @@ WRITE_TOOLS = [
             "playlist_id": {"type": "integer", "minimum": 1},
             "name": {"type": "string", "minLength": 1, "maxLength": 80},
             "description": {"type": "string", "maxLength": 1000},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
         ["playlist_id"],
         read_only=False,
@@ -312,7 +299,7 @@ WRITE_TOOLS = [
     ),
     _tool(
         "add_to_playlist",
-        "Add song IDs to a playlist. Under risk_based policy, an owned playlist and 1-10 songs may be written once without preview; larger writes require preview.",
+        "Add 1-50 unique song IDs to a playlist owned by the current user. This writes immediately after validation and records an audit entry.",
         {
             "playlist_id": {"type": "integer", "minimum": 1},
             "song_ids": {
@@ -321,13 +308,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 50,
             },
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
-            "idempotency_key": {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 100,
-                "pattern": "^[A-Za-z0-9._:-]+$",
-            },
+            "idempotency_key": _idempotency_schema(),
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -343,7 +324,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 50,
             },
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -360,7 +341,7 @@ WRITE_TOOLS = [
                 "minItems": 1,
                 "maxItems": 10000,
             },
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
         ["playlist_id", "song_ids"],
         read_only=False,
@@ -368,17 +349,11 @@ WRITE_TOOLS = [
     ),
     _tool(
         "like_song",
-        "Like or unlike a song. Under risk_based policy, like=true may be written once without preview; unlike always requires preview.",
+        "Like or unlike a song immediately after validation. The operation is audited and may be undone while its recorded state remains current.",
         {
             "song_id": {"type": "integer", "minimum": 1},
             "like": {"type": "boolean", "default": True},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
-            "idempotency_key": {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 100,
-                "pattern": "^[A-Za-z0-9._:-]+$",
-            },
+            "idempotency_key": _idempotency_schema(),
         },
         ["song_id"],
         read_only=False,
@@ -389,9 +364,9 @@ WRITE_TOOLS = [
         "Undo one successful reversible operation after verifying that its recorded after-state is still current. This modifies data and is itself logged.",
         {
             "operation_id": {"type": "string", "minLength": 1, "maxLength": 100},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
-        ["operation_id", "preview_token"],
+        ["operation_id"],
         read_only=False,
         destructive=True,
     ),
@@ -411,29 +386,23 @@ WRITE_TOOLS = [
                 "required": ["download_url", "file_id"],
                 "additionalProperties": False,
             },
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
-        ["playlist_id", "image", "preview_token"],
+        ["playlist_id", "image"],
         read_only=False,
         destructive=True,
         meta={"openai/fileParams": ["image"]},
     ),
     _tool(
         "create_interaction_note",
-        "Create a private plugin-owned playlist or track note. Under risk_based policy, a validated private note may be written once without preview.",
+        "Create a private plugin-owned playlist or track note immediately after validation and access checks.",
         {
             "playlist_id": {"type": "integer", "minimum": 1},
             "song_id": {"type": "integer", "minimum": 1},
             "author": {"type": "string", "minLength": 1, "maxLength": 80},
             "content": {"type": "string", "minLength": 1, "maxLength": 2000},
             "visibility": {"type": "string", "enum": ["private"], "default": "private"},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
-            "idempotency_key": {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 100,
-                "pattern": "^[A-Za-z0-9._:-]+$",
-            },
+            "idempotency_key": _idempotency_schema(),
         },
         ["playlist_id", "author", "content"],
         read_only=False,
@@ -446,11 +415,11 @@ WRITE_TOOLS = [
             "version": {"type": "integer", "minimum": 1},
             "author": {"type": "string", "minLength": 1, "maxLength": 80},
             "content": {"type": "string", "minLength": 1, "maxLength": 2000},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
-        ["note_id", "version", "preview_token"],
+        ["note_id", "version"],
         read_only=False,
-        min_properties=4,
+        min_properties=3,
     ),
     _tool(
         "delete_interaction_note",
@@ -458,9 +427,9 @@ WRITE_TOOLS = [
         {
             "note_id": {"type": "string", "minLength": 1, "maxLength": 100},
             "version": {"type": "integer", "minimum": 1},
-            "preview_token": {"type": "string", "minLength": 20, "maxLength": 200},
+            "idempotency_key": _idempotency_schema(),
         },
-        ["note_id", "version", "preview_token"],
+        ["note_id", "version"],
         read_only=False,
         destructive=True,
     ),
@@ -620,14 +589,6 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _state_hash(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _preview_token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
 def _store() -> PersistentStore:
     global STORE_INSTANCE
     if not STORAGE_PATH:
@@ -641,7 +602,6 @@ def _store() -> PersistentStore:
                     STORAGE_PATH,
                     retention_days=OPERATION_RETENTION_DAYS,
                     max_operations=MAX_OPERATION_LOGS,
-                    max_previews=MAX_PENDING_PREVIEWS,
                 )
                 STORE_INSTANCE.initialize()
     return STORE_INSTANCE
@@ -1921,61 +1881,11 @@ def _build_operation_plan(
         "target": target,
         "before": before_state,
         "expected_after": expected_after,
-        "state_hash": _state_hash(before_state),
         "risk_level": risk_level,
         "reversible": reversible,
         "artifact": artifact,
         "artifact_meta": artifact_meta,
-    }
-
-
-def preview_operation(operation: Any, arguments: Any) -> str:
-    if READ_ONLY:
-        raise PermissionError("Write tools are disabled; previews are available in read-write mode.")
-    if not isinstance(operation, str):
-        raise ValueError("operation must be a string.")
-    normalized = _normalize_write_arguments(operation, arguments)
-    user_id = get_uid()
-    plan = _build_operation_plan(operation, normalized, arguments, user_id)
-
-    preview_token = secrets.token_urlsafe(32)
-    created_at = utc_now()
-    expires_at = time.time() + PREVIEW_TTL_SECONDS
-    sanitized_arguments = _sanitize_value(normalized)
-    _store().save_preview(
-        {
-            "token_hash": _preview_token_hash(preview_token),
-            "user_id": user_id,
-            "operation": operation,
-            "arguments": normalized,
-            "sanitized_arguments": sanitized_arguments,
-            "target": plan["target"],
-            "before_state": plan["before"],
-            "expected_after_state": plan["expected_after"],
-            "state_hash": plan["state_hash"],
-            "risk_level": plan["risk_level"],
-            "reversible": plan["reversible"],
-            "artifact": plan["artifact"],
-            "artifact_meta": plan["artifact_meta"],
-            "created_at": created_at,
-            "expires_at": expires_at,
-        }
-    )
-    return _json_text(
-        {
-            "operation": operation,
-            "normalized_arguments": sanitized_arguments,
-            "target": plan["target"],
-            "before_state": plan["before"],
-            "expected_after_state": plan["expected_after"],
-            "risk_level": plan["risk_level"],
-            "reversible": plan["reversible"],
-            "preview_token": preview_token,
-            "created_at": created_at,
-            "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "expires_in_seconds": PREVIEW_TTL_SECONDS,
-        }
-    )
+}
 
 
 def get_operation_log(
@@ -2446,9 +2356,7 @@ def _execute_audited_write(
     plan: dict[str, Any],
     user_id: int,
     *,
-    preview_token_hash: str | None = None,
     idempotency_key: str | None = None,
-    revalidate_preview: bool = False,
 ) -> str:
     if idempotency_key is not None:
         existing = _store().get_operation_by_idempotency(
@@ -2491,63 +2399,6 @@ def _execute_audited_write(
             upstream_action_started = True
 
     try:
-        if revalidate_preview:
-            try:
-                current_state = _current_state_for_operation(operation, normalized, user_id)
-            except (ValueError, PermissionError) as exc:
-                error = _redact_secrets(exc)
-                conflict_result = {
-                    "operation_id": operation_id,
-                    "operation": operation,
-                    "status": "conflict",
-                    "upstream_action_started": False,
-                    "error_summary": error,
-                }
-                _store().finish_operation(
-                    operation_id,
-                    status="conflict",
-                    after_state=_best_effort_after_state(operation, normalized, user_id),
-                    result=conflict_result,
-                    error_summary=error,
-                )
-                if preview_token_hash is not None:
-                    _store().finish_preview(
-                        preview_token_hash,
-                        "conflict",
-                        operation_id=operation_id,
-                        result=conflict_result,
-                    )
-                if isinstance(exc, PermissionError):
-                    raise PermissionError(error) from None
-                raise ValueError(error) from None
-            if _state_hash(current_state) != plan.get("state_hash"):
-                error = (
-                    "The resource changed after preview; no write was performed. "
-                    "Create a new preview."
-                )
-                conflict_result = {
-                    "operation_id": operation_id,
-                    "operation": operation,
-                    "status": "conflict",
-                    "upstream_action_started": False,
-                    "error_summary": error,
-                }
-                _store().finish_operation(
-                    operation_id,
-                    status="conflict",
-                    after_state=current_state,
-                    result=conflict_result,
-                    error_summary=error,
-                )
-                if preview_token_hash is not None:
-                    _store().finish_preview(
-                        preview_token_hash,
-                        "conflict",
-                        operation_id=operation_id,
-                        result=conflict_result,
-                    )
-                raise ValueError(error)
-
         action_result = _execute_operation_action(
             operation,
             normalized,
@@ -2602,13 +2453,6 @@ def _execute_audited_write(
         _store().finish_operation(
             operation_id, status="success", after_state=after_state, result=final_result
         )
-        if preview_token_hash is not None:
-            _store().finish_preview(
-                preview_token_hash,
-                "consumed",
-                operation_id=operation_id,
-                result=final_result,
-            )
         return _json_text(final_result)
     except Exception as exc:
         existing = _store().get_operation(operation_id, user_id)
@@ -2643,18 +2487,6 @@ def _execute_audited_write(
             result=failure_result,
             error_summary=safe_error,
         )
-        if preview_token_hash is not None:
-            if upstream_action_started:
-                _store().finish_preview(
-                    preview_token_hash,
-                    "consumed",
-                    operation_id=operation_id,
-                    result=failure_result,
-                )
-            else:
-                _store().release_preview(
-                    preview_token_hash, operation_id, failure_result
-                )
         if isinstance(exc, PermissionError):
             raise PermissionError(safe_error) from None
         if isinstance(exc, ValueError):
@@ -2662,70 +2494,31 @@ def _execute_audited_write(
         raise NetEaseError(safe_error) from None
 
 
-def _execute_previewed_operation(
-    operation: str, raw_arguments: dict[str, Any], preview_token: Any
-) -> str:
-    if not isinstance(preview_token, str) or not 20 <= len(preview_token) <= 200:
-        raise ValueError("A valid preview_token is required. Call preview_operation first.")
+def _preflight_target_hint(
+    operation: str, normalized: dict[str, Any]
+) -> dict[str, Any]:
+    resource_types = {
+        "create_playlist": "playlist",
+        "update_playlist": "playlist",
+        "add_to_playlist": "playlist_tracks",
+        "remove_from_playlist": "playlist_tracks",
+        "reorder_playlist_tracks": "playlist_tracks",
+        "like_song": "song_like",
+        "undo_operation": "operation",
+        "update_playlist_cover": "playlist_cover",
+        "create_interaction_note": "interaction_note",
+        "update_interaction_note": "interaction_note",
+        "delete_interaction_note": "interaction_note",
+    }
+    target: dict[str, Any] = {"resource_type": resource_types.get(operation, operation)}
+    for field in ("playlist_id", "song_id", "note_id", "operation_id"):
+        if normalized.get(field) is not None:
+            target[field] = normalized[field]
+    return target
+
+
+def _execute_direct_write(operation: str, raw_arguments: dict[str, Any]) -> str:
     normalized = _normalize_write_arguments(operation, raw_arguments)
-    user_id = get_uid()
-    token_hash = _preview_token_hash(preview_token)
-    claim_status, preview = _store().claim_preview(
-        token_hash, user_id, operation, normalized
-    )
-    if claim_status == "consumed":
-        result = preview.get("result") or {}
-        if result.get("status") != "success":
-            raise NetEaseError(
-                result.get("error_summary") or "The previous execution attempt failed."
-            )
-        result["idempotent_replay"] = True
-        return _json_text(result)
-    return _execute_audited_write(
-        operation,
-        normalized,
-        preview,
-        user_id,
-        preview_token_hash=token_hash,
-        revalidate_preview=True,
-    )
-
-
-def _risk_based_direct_eligible(operation: str, normalized: dict[str, Any]) -> bool:
-    if operation == "add_to_playlist":
-        return 1 <= len(normalized["song_ids"]) <= 10
-    if operation == "like_song":
-        return normalized["like"] is True
-    if operation == "create_interaction_note":
-        return normalized["visibility"] == "private"
-    return False
-
-
-def _risk_based_direct_candidate(
-    operation: str, raw_arguments: dict[str, Any]
-) -> bool:
-    if operation == "add_to_playlist":
-        raw_ids = raw_arguments.get("song_ids")
-        return not isinstance(raw_ids, list) or len(raw_ids) <= 10
-    if operation == "like_song":
-        return raw_arguments.get("like", True) is not False
-    if operation == "create_interaction_note":
-        return raw_arguments.get("visibility", "private") == "private"
-    return False
-
-
-def _execute_risk_based_direct(
-    operation: str, raw_arguments: dict[str, Any]
-) -> str:
-    if not _risk_based_direct_candidate(operation, raw_arguments):
-        raise ValueError(
-            "This operation requires a matching preview_token under risk_based policy."
-        )
-    normalized = _normalize_write_arguments(operation, raw_arguments)
-    if not _risk_based_direct_eligible(operation, normalized):
-        raise ValueError(
-            "This operation requires a matching preview_token under risk_based policy."
-        )
     raw_idempotency_key = _clean_idempotency_key(raw_arguments.get("idempotency_key"))
     idempotency_key = (
         _idempotency_key_hash(raw_idempotency_key)
@@ -2743,34 +2536,19 @@ def _execute_risk_based_direct(
         plan = _build_operation_plan(operation, normalized, raw_arguments, user_id)
     except Exception as exc:
         operation_id = str(uuid.uuid4())
-        target = (
-            {
-                "resource_type": "playlist_tracks",
-                "playlist_id": normalized.get("playlist_id"),
-            }
-            if operation == "add_to_playlist"
-            else {
-                "resource_type": "song_like",
-                "song_id": normalized.get("song_id"),
-            }
-            if operation == "like_song"
-            else {
-                "resource_type": "interaction_note",
-                "playlist_id": normalized.get("playlist_id"),
-                "song_id": normalized.get("song_id"),
-            }
-        )
         inserted = _store().start_operation(
             {
                 "operation_id": operation_id,
                 "user_id": user_id,
                 "operation": operation,
                 "sanitized_arguments": _sanitize_value(normalized),
-                "target": target,
+                "target": _preflight_target_hint(operation, normalized),
                 "created_at": utc_now(),
                 "before_state": None,
                 "reversible": False,
-                "parent_operation_id": None,
+                "parent_operation_id": normalized.get("operation_id")
+                if operation == "undo_operation"
+                else None,
                 "idempotency_key": idempotency_key,
             }
         )
@@ -2818,25 +2596,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
     if name in WRITE_TOOL_NAMES and READ_ONLY:
         raise PermissionError("Write tools are disabled. Set MCP_READ_ONLY=false to enable them.")
     if name in WRITE_TOOL_NAMES:
-        preview_token = arguments.get("preview_token")
-        preview_only_tools = {
-            "undo_operation",
-            "update_playlist_cover",
-            "create_interaction_note",
-            "update_interaction_note",
-            "delete_interaction_note",
-        }
-        if preview_token is not None:
-            return _execute_previewed_operation(name, arguments, preview_token)
-        policy = _effective_write_preview_policy()
-        if policy == "risk_based":
-            return _execute_risk_based_direct(name, arguments)
-        if policy == "strict" or name in preview_only_tools:
-            raise ValueError(
-                "This write requires a matching preview_token. Call preview_operation with the same operation and arguments first."
-            )
-        if policy != "legacy_direct":
-            raise ValueError("The configured write preview policy is invalid.")
+        return _execute_direct_write(name, arguments)
     if name == "search_song":
         return search_song(arguments.get("query"), arguments.get("limit", 5))
     if name == "list_my_playlists":
@@ -2886,8 +2646,6 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         return get_recent_podcast_plays(arguments.get("limit", 50))
     if name == "daily_recommend":
         return daily_recommend()
-    if name == "preview_operation":
-        return preview_operation(arguments.get("operation"), arguments.get("arguments"))
     if name == "get_operation_log":
         return get_operation_log(
             arguments.get("limit", 50),
@@ -2905,26 +2663,6 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
             arguments.get("limit", 50),
             arguments.get("offset", 0),
         )
-    if name == "create_playlist":
-        return create_playlist(
-            arguments.get("name"), arguments.get("description", ""), arguments.get("privacy", 10)
-        )
-    if name == "update_playlist":
-        return update_playlist(
-            arguments.get("playlist_id"),
-            arguments.get("name"),
-            arguments.get("description"),
-        )
-    if name == "add_to_playlist":
-        return manipulate_playlist("add", arguments.get("playlist_id"), arguments.get("song_ids"))
-    if name == "remove_from_playlist":
-        return manipulate_playlist("del", arguments.get("playlist_id"), arguments.get("song_ids"))
-    if name == "reorder_playlist_tracks":
-        return reorder_playlist_tracks(
-            arguments.get("playlist_id"), arguments.get("song_ids")
-        )
-    if name == "like_song":
-        return like_song(arguments.get("song_id"), arguments.get("like", True))
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -2940,11 +2678,11 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "netease-music-mcp-safe", "version": "4.0.0"},
                 "instructions": (
-                    "The server enforces its configured write preview policy. Under strict policy, call "
-                    "preview_operation before every write. Under risk_based policy, only documented low-risk "
-                    "writes may run once without a preview; all other writes still require preview_token. "
-                    "Never reuse a preview for different arguments. Interaction notes are private plugin-owned data, "
-                    "not native NetEase comments."
+                    "Write tools execute in one call after parameter, ownership, and state checks. "
+                    "They are audited with before/after state and are never automatically retried when "
+                    "the upstream result is partial or unknown. Reuse an idempotency_key only for the "
+                    "same intended write. Interaction notes are private plugin-owned data, not native "
+                    "NetEase comments."
                 ),
             },
         }
@@ -3526,43 +3264,20 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_ACCESS_TOKEN before starting.")
     if MAX_REQUEST_BYTES < 1024:
         raise SystemExit("MCP_MAX_REQUEST_BYTES must be at least 1024.")
-    if WRITE_PREVIEW_POLICY_SOURCE == "MCP_WRITE_PREVIEW_POLICY" and WRITE_PREVIEW_POLICY not in {
-        "strict",
-        "risk_based",
-    }:
-        raise SystemExit("MCP_WRITE_PREVIEW_POLICY must be strict or risk_based.")
-    effective_policy = _effective_write_preview_policy()
-    if CONFIGURED_WRITE_PREVIEW_POLICY is not None and LEGACY_WRITE_PREVIEW_EXPLICIT:
-        legacy_policy = "strict" if REQUIRE_WRITE_PREVIEW else "legacy_direct"
-        if legacy_policy != effective_policy:
-            LOG.warning(
-                "Write preview configuration conflicts; using %s from MCP_WRITE_PREVIEW_POLICY "
-                "and ignoring MCP_REQUIRE_WRITE_PREVIEW.",
-                effective_policy,
-            )
-        else:
-            LOG.info(
-                "Write preview policy is %s; both configuration variables agree.",
-                effective_policy,
-            )
-    else:
-        LOG.info(
-            "Write preview policy is %s (source: %s).",
-            effective_policy,
-            WRITE_PREVIEW_POLICY_SOURCE,
+    if DEPRECATED_WRITE_PREVIEW_VARS:
+        LOG.warning(
+            "Ignoring deprecated write-preview environment variables: %s. "
+            "All enabled write tools now execute in one audited call.",
+            ", ".join(DEPRECATED_WRITE_PREVIEW_VARS),
         )
     if not READ_ONLY and not STORAGE_PATH:
         raise SystemExit(
             "MCP_STORAGE_PATH is required in read-write mode. Point it to a SQLite file on a persistent volume."
         )
-    if not 30 <= PREVIEW_TTL_SECONDS <= 3600:
-        raise SystemExit("MCP_PREVIEW_TTL_SECONDS must be between 30 and 3600.")
     if not 1 <= OPERATION_RETENTION_DAYS <= 3650:
         raise SystemExit("MCP_OPERATION_RETENTION_DAYS must be between 1 and 3650.")
     if not 100 <= MAX_OPERATION_LOGS <= 100000:
         raise SystemExit("MCP_MAX_OPERATION_LOGS must be between 100 and 100000.")
-    if not 10 <= MAX_PENDING_PREVIEWS <= 10000:
-        raise SystemExit("MCP_MAX_PENDING_PREVIEWS must be between 10 and 10000.")
     if not 1_048_576 <= MAX_IMAGE_BYTES <= 20_971_520:
         raise SystemExit("MCP_MAX_IMAGE_BYTES must be between 1 MiB and 20 MiB.")
     if not 1_000_000 <= MAX_IMAGE_PIXELS <= 100_000_000:

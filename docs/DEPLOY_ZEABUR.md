@@ -27,16 +27,13 @@ Before enabling writes, attach a persistent volume mounted at `/data` and add:
 | Variable | Recommended value |
 | --- | --- |
 | `MCP_STORAGE_PATH` | `/data/netease-music-mcp.sqlite3` |
-| `MCP_WRITE_PREVIEW_POLICY` | `strict` |
-| `MCP_REQUIRE_WRITE_PREVIEW` | `true` |
-| `MCP_PREVIEW_TTL_SECONDS` | `300` |
 | `MCP_OPERATION_RETENTION_DAYS` | `90` |
 | `MCP_MAX_OPERATION_LOGS` | `1000` |
 | `MCP_MAX_IMAGE_BYTES` | `5242880` |
 | `MCP_MAX_IMAGE_PIXELS` | `25000000` |
 
-The SQLite file contains private interaction notes, pending preview state, and sanitized operation
-history. The application filesystem without a volume is ephemeral and must not be used for this
+The SQLite file contains private interaction notes and sanitized operation history. The application
+filesystem without a volume is ephemeral and must not be used for this
 data. Run one service instance against one SQLite file. Back up the volume or use a
 SQLite-consistent backup before migration or uninstall.
 
@@ -64,17 +61,19 @@ tool.
 
 To enable write tools, confirm the persistent volume and database path first, then set
 `MCP_READ_ONLY=false`, redeploy, refresh the app's action definitions, and disconnect and reconnect
-the ChatGPT app to grant `netease.write` and reload the current tool schemas. Keep
-`MCP_WRITE_PREVIEW_POLICY=strict` for the original behavior: ChatGPT must call
-`preview_operation`, show the proposed state, and pass its short-lived token to the matching write.
-The legacy `MCP_REQUIRE_WRITE_PREVIEW` is consulted only when the new variable is absent; if both
-are set, `MCP_WRITE_PREVIEW_POLICY` wins and a conflict is reported in startup logs without secrets.
+the ChatGPT app to grant `netease.write` and reload the current tool schemas. Every enabled write
+tool executes in one call after backend argument, ownership, state, and file-safety checks. Audit
+logs, before/after snapshots, idempotency, undo, and partial/unknown status handling remain active.
 
-After strict mode has been verified, `MCP_WRITE_PREVIEW_POLICY=risk_based` may be used to permit
-only owned-playlist additions of at most 10 songs, likes (`like=true`), and validated private-note
-creation as single-call audited writes. All other writes still require preview. Do not set the
-legacy boolean to `false`; that selects the old unaudited compatibility behavior only when the new
-policy variable is absent.
+Delete these deprecated variables from Zeabur after deploying this version:
+
+- `MCP_WRITE_PREVIEW_POLICY`
+- `MCP_REQUIRE_WRITE_PREVIEW`
+- `MCP_PREVIEW_TTL_SECONDS`
+- `MCP_MAX_PENDING_PREVIEWS`
+
+If they remain temporarily, the server logs their names as deprecated and ignores their values;
+they cannot restore strict or risk-based behavior and do not cause startup rejection.
 
 On the first deployment of this version, the existing SQLite database automatically gains
 `upstream_action_started`, a hashed idempotency-key column, and its partial unique index. Take a
