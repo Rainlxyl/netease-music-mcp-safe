@@ -68,6 +68,34 @@ class ToolTests(unittest.TestCase):
         names = {tool["name"] for tool in module.available_tools()}
         self.assertEqual(names, module.READ_TOOL_NAMES | module.WRITE_TOOL_NAMES)
 
+    def test_every_listed_tool_has_a_call_dispatch_path(self):
+        module = load_server("false")
+        read_handlers = {
+            "search_song": mock.DEFAULT,
+            "list_my_playlists": mock.DEFAULT,
+            "get_playlist_songs": mock.DEFAULT,
+            "get_song_details": mock.DEFAULT,
+            "get_play_history": mock.DEFAULT,
+            "get_recent_plays": mock.DEFAULT,
+            "list_my_subscribed_podcasts": mock.DEFAULT,
+            "get_podcast_programs": mock.DEFAULT,
+            "search_podcasts": mock.DEFAULT,
+            "search_podcast_programs": mock.DEFAULT,
+            "get_recent_podcast_plays": mock.DEFAULT,
+            "daily_recommend": mock.DEFAULT,
+            "get_operation_log": mock.DEFAULT,
+            "list_interaction_notes": mock.DEFAULT,
+        }
+        with mock.patch.multiple(module, **read_handlers) as handlers, mock.patch.object(
+            module, "_execute_direct_write", return_value="dispatched"
+        ):
+            for handler in handlers.values():
+                handler.return_value = "dispatched"
+            for tool in module.available_tools():
+                arguments = {"song_id": 1} if tool["name"] == "get_song_details" else {}
+                with self.subTest(tool=tool["name"]):
+                    self.assertEqual(module.call_tool(tool["name"], arguments), "dispatched")
+
     def test_tool_annotations_distinguish_reads_and_writes(self):
         module = load_server("false")
         tools = {tool["name"]: tool for tool in module.available_tools()}
@@ -1072,6 +1100,28 @@ class DirectWriteTests(unittest.TestCase):
                 call.args[0] in self.module.WRITE_TOOL_NAMES
                 for call in execute.call_args_list
             )
+        )
+
+    def test_create_and_add_enter_mock_write_flow_without_preview_token(self):
+        with mock.patch.object(
+            self.module, "_execute_direct_write", return_value="direct"
+        ) as execute:
+            self.assertEqual(
+                self.module.call_tool("create_playlist", {"name": "Synthetic playlist"}),
+                "direct",
+            )
+            self.assertEqual(
+                self.module.call_tool(
+                    "add_to_playlist", {"playlist_id": 9, "song_ids": [1]}
+                ),
+                "direct",
+            )
+        self.assertEqual(
+            execute.call_args_list,
+            [
+                mock.call("create_playlist", {"name": "Synthetic playlist"}),
+                mock.call("add_to_playlist", {"playlist_id": 9, "song_ids": [1]}),
+            ],
         )
 
     def test_remove_and_reorder_are_direct_and_post_verified(self):
