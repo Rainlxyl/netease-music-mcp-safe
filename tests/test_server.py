@@ -30,6 +30,7 @@ def load_server(
     token="a-secure-test-token-that-is-long",
     oauth=False,
     *,
+    default_timezone="Asia/Shanghai",
     legacy_preview_env=None,
 ):
     env = {
@@ -39,6 +40,7 @@ def load_server(
         "MCP_PUBLIC_URL": "https://music.example.test" if oauth else "",
         "MCP_OAUTH_PASSWORD": "a-different-oauth-password" if oauth else "",
         "MCP_STORAGE_PATH": "",
+        "MCP_DEFAULT_TIMEZONE": default_timezone,
     }
     with mock.patch.dict(os.environ, env, clear=False):
         for name in (
@@ -57,6 +59,26 @@ def load_server(
 
 
 class ToolTests(unittest.TestCase):
+    def recent_play_event(self, default_timezone, played_at_utc):
+        module = load_server("true", default_timezone=default_timezone)
+        play_time_ms = int(played_at_utc.timestamp() * 1000)
+        response = {
+            "code": 200,
+            "data": {
+                "total": 1,
+                "list": [
+                    {
+                        "resourceId": "1",
+                        "playTime": play_time_ms,
+                        "data": {"id": 1, "name": "Timed", "ar": []},
+                    }
+                ],
+            },
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            payload = json.loads(module.get_recent_plays(1))
+        return payload, payload["events"][0]
+
     def test_read_only_lists_only_read_tools(self):
         module = load_server("true")
         names = {tool["name"] for tool in module.available_tools()}
@@ -108,9 +130,45 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(tools["update_playlist"]["annotations"]["destructiveHint"])
         self.assertEqual(tools["update_playlist"]["inputSchema"]["minProperties"], 2)
         self.assertTrue(tools["reorder_playlist_tracks"]["annotations"]["destructiveHint"])
+        curated_schema = tools["create_curated_playlist"]["inputSchema"]
+        self.assertEqual(
+            set(curated_schema["required"]),
+            {"name", "description", "privacy", "song_ids", "idempotency_key"},
+        )
+        self.assertTrue(curated_schema["properties"]["song_ids"]["uniqueItems"])
+        self.assertEqual(curated_schema["properties"]["song_ids"]["maxItems"], 50)
         playlist_schema = tools["get_playlist_songs"]["inputSchema"]["properties"]
         self.assertEqual(playlist_schema["limit"]["default"], 50)
         self.assertEqual(playlist_schema["offset"]["default"], 0)
+
+    def test_time_aware_tool_descriptions_explain_model_facing_semantics(self):
+        module = load_server("true")
+        descriptions = {
+            tool["name"]: tool["description"] for tool in module.available_tools()
+        }
+        recent = descriptions["get_recent_plays"]
+        self.assertIn("played_at and played_at_utc are UTC", recent)
+        self.assertIn("prefer played_at_local", recent)
+        self.assertIn("using timezone", recent)
+
+        podcast = descriptions["get_recent_podcast_plays"]
+        self.assertIn("played_at and played_at_utc are UTC", podcast)
+        self.assertIn("played_at_local together with timezone", podcast)
+
+        audit = descriptions["get_operation_log"]
+        self.assertIn("explicit *_utc fields are UTC", audit)
+        self.assertIn("*_local with the matching *_timezone", audit)
+
+        notes = descriptions["list_interaction_notes"]
+        self.assertIn("explicit *_utc fields are UTC", notes)
+        self.assertIn("*_local with the matching *_timezone", notes)
+
+        daily = descriptions["daily_recommend"]
+        self.assertIn("affects only display and date-language context", daily)
+        self.assertIn("NetEase supplies the feed", daily)
+        self.assertIn("controls its refresh boundary", daily)
+        self.assertIn("cannot change that boundary", daily)
+        self.assertIn("does not infer today from the deployment host", daily)
 
     def test_write_mode_advertises_write_oauth_scope(self):
         module = load_server("false", oauth=True)
@@ -254,6 +312,11 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(full["album"]["name"], "Album")
         self.assertEqual(full["duration_ms"], 123456)
         self.assertEqual(full["release_time"], "1970-01-01T00:00:00Z")
+        self.assertEqual(full["release_time_utc"], full["release_time"])
+        self.assertEqual(
+            full["release_time_local"], "1970-01-01T08:00:00+08:00"
+        )
+        self.assertEqual(full["release_timezone"], "Asia/Shanghai")
         self.assertTrue(full["version_flags"]["live"])
         self.assertIsNone(full["version_flags"]["remix"])
         self.assertEqual(full["version_detection"], "explicit_upstream_metadata_only; title_not_parsed")
@@ -287,7 +350,81 @@ class ToolTests(unittest.TestCase):
         self.assertEqual([event["song_id"] for event in payload["events"]], [2, 1])
         self.assertEqual([event["play_time_ms"] for event in payload["events"]], [2000, 1000])
         self.assertEqual(payload["events"][0]["played_at"], "1970-01-01T00:00:02Z")
+        self.assertEqual(
+            payload["events"][0]["played_at_utc"], "1970-01-01T00:00:02Z"
+        )
+        self.assertEqual(
+            payload["events"][0]["played_at_local"],
+            "1970-01-01T08:00:02+08:00",
+        )
+        self.assertEqual(payload["events"][0]["timezone"], "Asia/Shanghai")
+        self.assertEqual(payload["events"][0]["utc_offset"], "+08:00")
         self.assertEqual(payload["events"][0]["source_device"], "Web")
+
+    def test_recent_play_timezone_utc(self):
+        payload, event = self.recent_play_event(
+            "UTC", datetime(2024, 1, 1, 12, 30, tzinfo=timezone.utc)
+        )
+        self.assertEqual(payload["timezone"], "UTC")
+        self.assertEqual(event["played_at"], "2024-01-01T12:30:00Z")
+        self.assertEqual(event["played_at_utc"], "2024-01-01T12:30:00Z")
+        self.assertEqual(event["played_at_local"], "2024-01-01T12:30:00+00:00")
+        self.assertEqual(event["timezone"], "UTC")
+        self.assertEqual(event["utc_offset"], "+00:00")
+
+    def test_recent_play_timezone_shanghai_crosses_midnight(self):
+        _, event = self.recent_play_event(
+            "Asia/Shanghai", datetime(2024, 1, 1, 16, 30, tzinfo=timezone.utc)
+        )
+        self.assertEqual(event["played_at_utc"], "2024-01-01T16:30:00Z")
+        self.assertEqual(
+            event["played_at_local"], "2024-01-02T00:30:00+08:00"
+        )
+        self.assertEqual(event["utc_offset"], "+08:00")
+
+    def test_recent_play_timezone_new_york_observes_daylight_saving(self):
+        _, summer = self.recent_play_event(
+            "America/New_York", datetime(2024, 7, 1, 12, 0, tzinfo=timezone.utc)
+        )
+        _, winter = self.recent_play_event(
+            "America/New_York", datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+        )
+        self.assertEqual(summer["played_at_local"], "2024-07-01T08:00:00-04:00")
+        self.assertEqual(summer["utc_offset"], "-04:00")
+        self.assertEqual(winter["played_at_local"], "2024-01-01T07:00:00-05:00")
+        self.assertEqual(winter["utc_offset"], "-05:00")
+
+    def test_daily_recommend_keeps_legacy_text_and_documents_time_semantics(self):
+        module = load_server("true", default_timezone="America/New_York")
+        response = {
+            "data": {
+                "dailySongs": [
+                    {"id": 1, "name": "Daily", "ar": [{"name": "Artist"}]}
+                ]
+            }
+        }
+        with mock.patch.object(module, "netease_request", return_value=response):
+            output = module.daily_recommend()
+        self.assertEqual(
+            output,
+            "Today's recommendations:\n1. Daily - Artist (ID:1)",
+        )
+        tool = next(
+            item
+            for item in module.available_tools()
+            if item["name"] == "daily_recommend"
+        )
+        self.assertIn("NetEase supplies the feed", tool["description"])
+        self.assertIn("cannot change that boundary", tool["description"])
+
+    def test_invalid_default_timezone_is_rejected_at_startup(self):
+        for invalid_timezone in ("Not/A_Timezone", "+08:00"):
+            with self.subTest(default_timezone=invalid_timezone):
+                module = load_server(
+                    "true", default_timezone=invalid_timezone
+                )
+                with self.assertRaisesRegex(SystemExit, "valid IANA timezone"):
+                    module.validate_startup()
 
     def test_get_recent_plays_does_not_fake_aggregate_data_as_events(self):
         module = load_server("true")
@@ -374,6 +511,12 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(program["main_track_id"], 9001)
         self.assertNotIn("song_id", program)
         self.assertEqual(program["public_listener_count"], 77)
+        self.assertEqual(program["published_at"], "1970-01-01T00:00:02Z")
+        self.assertEqual(program["published_at_utc"], program["published_at"])
+        self.assertEqual(
+            program["published_at_local"], "1970-01-01T08:00:02+08:00"
+        )
+        self.assertEqual(program["published_at_timezone"], "Asia/Shanghai")
         self.assertEqual(request.call_args.kwargs["data"]["asc"], "true")
 
     def test_search_podcasts_and_programs_parse_current_resource_shape(self):
@@ -443,7 +586,18 @@ class ToolTests(unittest.TestCase):
             payload = json.loads(module.get_recent_podcast_plays(2))
         self.assertEqual([item["program_id"] for item in payload["records"]], [502, 501])
         self.assertEqual(payload["records"][0]["played_at"], "1970-01-01T00:00:02Z")
+        self.assertEqual(
+            payload["records"][0]["played_at_utc"],
+            payload["records"][0]["played_at"],
+        )
+        self.assertEqual(
+            payload["records"][0]["played_at_local"],
+            "1970-01-01T08:00:02+08:00",
+        )
+        self.assertEqual(payload["records"][0]["timezone"], "Asia/Shanghai")
         self.assertIsNone(payload["records"][1]["played_at"])
+        self.assertIsNone(payload["records"][1]["played_at_local"])
+        self.assertIsNone(payload["records"][1]["utc_offset"])
         self.assertEqual(payload["records"][1]["public_listener_count"], 88)
         self.assertFalse(payload["personal_play_count_supported"])
         self.assertFalse(payload["limitations"]["complete_event_stream_guaranteed"])
@@ -1051,7 +1205,15 @@ class PersistenceAuditAndCoverTests(unittest.TestCase):
                 self.module.get_operation_log(operation="like_song", status="success")
             )
         self.assertEqual(payload["returned"], 1)
-        self.assertEqual(payload["operations"][0]["operation_id"], operation_id)
+        operation = payload["operations"][0]
+        self.assertEqual(operation["operation_id"], operation_id)
+        self.assertEqual(payload["timestamp_storage"], "UTC")
+        self.assertEqual(payload["timezone"], "Asia/Shanghai")
+        self.assertEqual(operation["created_at"], operation["created_at_utc"])
+        self.assertEqual(operation["completed_at"], operation["completed_at_utc"])
+        self.assertEqual(operation["created_at_timezone"], "Asia/Shanghai")
+        self.assertEqual(operation["created_at_utc_offset"], "+08:00")
+        self.assertTrue(operation["created_at_local"].endswith("+08:00"))
 
 
 class DirectWriteTests(unittest.TestCase):
@@ -1064,6 +1226,384 @@ class DirectWriteTests(unittest.TestCase):
     def tearDown(self):
         self.module.STORE_INSTANCE = None
         self.tempdir.cleanup()
+
+    def curated_arguments(self, song_ids=None, key="curated-playlist-1"):
+        return {
+            "name": "Night Signals",
+            "description": "A deliberate late-night sequence.",
+            "privacy": 10,
+            "song_ids": [11, 22, 33] if song_ids is None else song_ids,
+            "idempotency_key": key,
+        }
+
+    @staticmethod
+    def curated_state(arguments, song_ids=None, *, description=None, name=None):
+        ids = list(arguments["song_ids"] if song_ids is None else song_ids)
+        return {
+            "playlist_id": 901,
+            "creator_id": 7,
+            "name": arguments["name"] if name is None else name,
+            "description": (
+                arguments["description"] if description is None else description
+            ),
+            "privacy": arguments["privacy"],
+            "track_ids": ids,
+            "track_count": len(ids),
+        }
+
+    def call_successful_curated(self, arguments, snapshot_side_effect):
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={
+                "code": 200,
+                "playlist": {
+                    "id": 901,
+                    "name": arguments["name"],
+                    "description": arguments["description"],
+                },
+            },
+        ) as create, mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ) as add, mock.patch.object(
+            self.module,
+            "_curated_playlist_snapshot",
+            side_effect=snapshot_side_effect,
+        ), mock.patch.object(
+            self.module, "reorder_playlist_tracks", return_value='{"success": true}'
+        ) as reorder, mock.patch.object(
+            self.module, "update_playlist", return_value="updated"
+        ) as update:
+            result = json.loads(
+                self.module.call_tool("create_curated_playlist", arguments)
+            )
+        return result, create, add, reorder, update
+
+    def test_create_curated_playlist_success(self):
+        arguments = self.curated_arguments()
+        state = self.curated_state(arguments)
+        result, create, add, reorder, update = self.call_successful_curated(
+            arguments, [state, state]
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["result"]["success"])
+        self.assertEqual(result["result"]["stage"], "completed")
+        self.assertEqual(result["result"]["playlist_id"], 901)
+        self.assertTrue(all(result["result"]["completed"].values()))
+        self.assertEqual(result["after_state"]["track_ids"], arguments["song_ids"])
+        create.assert_called_once()
+        add.assert_called_once_with("add", 901, arguments["song_ids"])
+        reorder.assert_not_called()
+        update.assert_called_once_with(
+            901, description=arguments["description"]
+        )
+        record = self.module._store().get_operation(result["operation_id"], 7)
+        self.assertEqual(record["operation"], "create_curated_playlist")
+        self.assertEqual(record["status"], "success")
+        self.assertFalse(record["reversible"])
+        self.assertEqual(
+            record["sanitized_arguments"]["song_ids"], arguments["song_ids"]
+        )
+        self.assertTrue(record["created_at"].endswith("Z"))
+        self.assertTrue(record["completed_at"].endswith("Z"))
+        self.assertNotIn("created_at_local", record)
+        with mock.patch.object(self.module, "get_uid", return_value=7):
+            audit = json.loads(
+                self.module.get_operation_log(
+                    operation="create_curated_playlist", status="success"
+                )
+            )
+        audited = audit["operations"][0]
+        self.assertEqual(audited["created_at"], audited["created_at_utc"])
+        self.assertEqual(audited["completed_at"], audited["completed_at_utc"])
+        self.assertEqual(audited["created_at_timezone"], "Asia/Shanghai")
+        self.assertTrue(audited["created_at_local"].endswith("+08:00"))
+
+    def test_create_curated_playlist_restores_reversed_add_order(self):
+        arguments = self.curated_arguments()
+        reversed_state = self.curated_state(
+            arguments, list(reversed(arguments["song_ids"]))
+        )
+        final_state = self.curated_state(arguments)
+        result, _, _, reorder, _ = self.call_successful_curated(
+            arguments, [reversed_state, final_state]
+        )
+
+        self.assertTrue(result["result"]["reordered_after_add"])
+        self.assertEqual(result["after_state"]["track_ids"], arguments["song_ids"])
+        reorder.assert_called_once_with(901, arguments["song_ids"])
+
+    def test_create_curated_playlist_updates_description_when_create_ignored_it(self):
+        arguments = self.curated_arguments()
+        after_add = self.curated_state(arguments, description="")
+        final_state = self.curated_state(arguments)
+        result, _, _, _, update = self.call_successful_curated(
+            arguments, [after_add, final_state]
+        )
+
+        self.assertTrue(result["result"]["verification"]["description"])
+        update.assert_called_once_with(
+            901, description=arguments["description"]
+        )
+
+    def test_create_curated_playlist_reports_add_failure_and_retains_playlist(self):
+        arguments = self.curated_arguments()
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={"code": 200, "playlist": {"id": 901}},
+        ) as create, mock.patch.object(
+            self.module,
+            "manipulate_playlist",
+            side_effect=self.module.NetEaseError("add failed"),
+        ) as add:
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool("create_curated_playlist", arguments)
+            with self.assertRaises(self.module.NetEaseError) as replay_context:
+                self.module.call_tool("create_curated_playlist", arguments)
+
+        failure = json.loads(str(context.exception))
+        replay = json.loads(str(replay_context.exception))
+        self.assertFalse(failure["success"])
+        self.assertEqual(failure["status"], "partial_success")
+        self.assertEqual(failure["stage"], "adding_songs")
+        self.assertEqual(failure["playlist_id"], 901)
+        self.assertTrue(failure["completed"]["playlist_created"])
+        self.assertFalse(failure["completed"]["songs_added"])
+        self.assertTrue(failure["recovery"]["playlist_retained"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertTrue(replay["retry_suppressed"])
+        create.assert_called_once()
+        add.assert_called_once()
+        partial = self.module._store().get_operation_by_idempotency(
+            7,
+            "create_curated_playlist",
+            self.module._idempotency_key_hash(arguments["idempotency_key"]),
+        )
+        self.assertEqual(partial["status"], "partial_success")
+        self.assertTrue(partial["created_at"].endswith("Z"))
+        self.assertTrue(partial["completed_at"].endswith("Z"))
+        self.assertNotIn("created_at_local", partial)
+
+    def test_create_curated_playlist_reports_reorder_failure(self):
+        arguments = self.curated_arguments()
+        reversed_state = self.curated_state(
+            arguments, list(reversed(arguments["song_ids"]))
+        )
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={"code": 200, "playlist": {"id": 901}},
+        ), mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ), mock.patch.object(
+            self.module, "_curated_playlist_snapshot", return_value=reversed_state
+        ), mock.patch.object(
+            self.module,
+            "reorder_playlist_tracks",
+            side_effect=self.module.NetEaseError("reorder failed"),
+        ):
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool("create_curated_playlist", arguments)
+
+        failure = json.loads(str(context.exception))
+        self.assertEqual(failure["stage"], "reordering_tracks")
+        self.assertTrue(failure["completed"]["songs_added"])
+        self.assertFalse(failure["completed"]["order_restored"])
+        self.assertEqual(
+            failure["after_state"]["track_ids"],
+            list(reversed(arguments["song_ids"])),
+        )
+
+    def test_create_curated_playlist_reports_description_update_failure(self):
+        arguments = self.curated_arguments()
+        after_add = self.curated_state(arguments, description="")
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={"code": 200, "playlist": {"id": 901}},
+        ), mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ), mock.patch.object(
+            self.module, "_curated_playlist_snapshot", return_value=after_add
+        ), mock.patch.object(
+            self.module,
+            "update_playlist",
+            side_effect=self.module.NetEaseError("description failed"),
+        ):
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool("create_curated_playlist", arguments)
+
+        failure = json.loads(str(context.exception))
+        self.assertEqual(failure["stage"], "updating_description")
+        self.assertTrue(failure["completed"]["order_restored"])
+        self.assertFalse(failure["completed"]["description_updated"])
+        self.assertEqual(
+            failure["recovery"]["suggested_tools"],
+            ["update_playlist", "get_playlist_songs"],
+        )
+
+    def test_create_curated_playlist_reports_final_verification_failure(self):
+        arguments = self.curated_arguments()
+        after_add = self.curated_state(arguments, description="")
+        wrong_final = self.curated_state(
+            arguments,
+            [11, 33],
+            description="wrong",
+            name="wrong",
+        )
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={"code": 200, "playlist": {"id": 901}},
+        ), mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ), mock.patch.object(
+            self.module,
+            "_curated_playlist_snapshot",
+            side_effect=[after_add, wrong_final],
+        ), mock.patch.object(
+            self.module, "update_playlist", return_value="updated"
+        ):
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool("create_curated_playlist", arguments)
+
+        failure = json.loads(str(context.exception))
+        self.assertEqual(failure["stage"], "verifying_final_state")
+        self.assertTrue(failure["completed"]["description_updated"])
+        self.assertFalse(failure["completed"]["final_state_verified"])
+        self.assertIn("name", failure["error_summary"])
+        self.assertIn("description", failure["error_summary"])
+        self.assertIn("song_set", failure["error_summary"])
+        self.assertIn("song_count", failure["error_summary"])
+        self.assertIn("song_order", failure["error_summary"])
+
+    def test_create_curated_playlist_idempotent_retry_does_not_create_twice(self):
+        arguments = self.curated_arguments(key="curated-retry-1")
+        state = self.curated_state(arguments)
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module,
+            "_fetch_song_records",
+            return_value=[{"id": song_id} for song_id in arguments["song_ids"]],
+        ), mock.patch.object(
+            self.module,
+            "netease_request",
+            return_value={"code": 200, "playlist": {"id": 901}},
+        ) as create, mock.patch.object(
+            self.module, "manipulate_playlist", return_value="added"
+        ) as add, mock.patch.object(
+            self.module, "_curated_playlist_snapshot", side_effect=[state, state]
+        ), mock.patch.object(
+            self.module, "update_playlist", return_value="updated"
+        ):
+            first = json.loads(
+                self.module.call_tool("create_curated_playlist", arguments)
+            )
+            replay = json.loads(
+                self.module.call_tool("create_curated_playlist", arguments)
+            )
+
+        self.assertEqual(first["operation_id"], replay["operation_id"])
+        self.assertTrue(replay["idempotent_replay"])
+        create.assert_called_once()
+        add.assert_called_once()
+        records = self.module._store().query_operations(
+            7,
+            limit=10,
+            offset=0,
+            operation="create_curated_playlist",
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["operation_id"], first["operation_id"])
+        self.assertTrue(records[0]["created_at"].endswith("Z"))
+        self.assertTrue(records[0]["completed_at"].endswith("Z"))
+
+    def test_create_curated_playlist_rejects_duplicate_song_ids(self):
+        arguments = self.curated_arguments([11, 22, 11])
+        with mock.patch.object(self.module, "netease_request") as upstream:
+            with self.assertRaisesRegex(ValueError, "duplicates"):
+                self.module.call_tool("create_curated_playlist", arguments)
+        upstream.assert_not_called()
+
+    def test_create_curated_playlist_preserves_nontrivial_input_order(self):
+        arguments = self.curated_arguments([33, 11, 22], key="curated-order-1")
+        original_order = list(arguments["song_ids"])
+        state = self.curated_state(arguments)
+        result, _, add, _, _ = self.call_successful_curated(
+            arguments, [state, state]
+        )
+
+        self.assertEqual(arguments["song_ids"], original_order)
+        self.assertEqual(result["after_state"]["track_ids"], original_order)
+        add.assert_called_once_with("add", 901, original_order)
+
+    def test_create_curated_playlist_validates_empty_limits_ids_and_key(self):
+        cases = {
+            "empty": self.curated_arguments([]),
+            "too many": self.curated_arguments(list(range(1, 52))),
+            "non-positive": self.curated_arguments([1, 0]),
+        }
+        for label, arguments in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.module.call_tool("create_curated_playlist", arguments)
+        missing_key = self.curated_arguments()
+        missing_key.pop("idempotency_key")
+        with self.assertRaisesRegex(ValueError, "idempotency_key is required"):
+            self.module.call_tool("create_curated_playlist", missing_key)
+        for required_field in ("description", "privacy"):
+            missing_field = self.curated_arguments()
+            missing_field.pop(required_field)
+            with self.subTest(required_field=required_field), self.assertRaisesRegex(
+                ValueError, required_field
+            ):
+                self.module.call_tool("create_curated_playlist", missing_field)
+
+        arguments = self.curated_arguments(key="curated-invalid-song-1")
+        with mock.patch.object(
+            self.module, "get_uid", return_value=7
+        ), mock.patch.object(
+            self.module, "_fetch_song_records", return_value=[{"id": 11}, {"id": 33}]
+        ), mock.patch.object(self.module, "netease_request") as upstream:
+            with self.assertRaises(self.module.NetEaseError) as context:
+                self.module.call_tool("create_curated_playlist", arguments)
+        failure = json.loads(str(context.exception))
+        self.assertEqual(failure["status"], "failed_before_upstream")
+        self.assertEqual(failure["stage"], "validating_songs")
+        self.assertIsNone(failure["playlist_id"])
+        upstream.assert_not_called()
 
     def test_deprecated_preview_environment_is_ignored(self):
         module = load_server(
@@ -1435,6 +1975,11 @@ class DirectWriteTests(unittest.TestCase):
                 self.module.list_interaction_notes(9, song_id=11)
             )
         self.assertEqual(listed["returned"], 2)
+        note = listed["notes"][0]
+        self.assertEqual(note["created_at"], note["created_at_utc"])
+        self.assertEqual(note["created_at_timezone"], "Asia/Shanghai")
+        self.assertEqual(note["created_at_utc_offset"], "+08:00")
+        self.assertTrue(note["created_at_local"].endswith("+08:00"))
 
         with self.assertRaisesRegex(ValueError, "supports only private"):
             self.module.call_tool(
@@ -1553,6 +2098,7 @@ class HTTPTests(unittest.TestCase):
             body = response.read().decode()
             self.assertIsNone(response.headers.get("Mcp-Session-Id"))
         self.assertIn('"status": "ok"', body)
+        self.assertIn('"timezone": "Asia/Shanghai"', body)
         self.assertNotIn("MUSIC_U", body)
 
     def test_stateless_mcp_get_returns_method_not_allowed(self):

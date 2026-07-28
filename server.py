@@ -25,15 +25,17 @@ import urllib.request
 from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from image_safety import normalize_cover_image, validate_file_reference
 from persistence import PersistentStore, utc_now
 
 
 LOG = logging.getLogger("netease_music_mcp")
+logging.Formatter.converter = time.gmtime
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)sZ %(levelname)s %(message)s",
 )
 
 NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "").strip()
@@ -51,6 +53,13 @@ MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", "1048576"))
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
 STORAGE_PATH = os.environ.get("MCP_STORAGE_PATH", "").strip()
+DEFAULT_TIMEZONE_NAME = os.environ.get(
+    "MCP_DEFAULT_TIMEZONE", "Asia/Shanghai"
+).strip()
+try:
+    DEFAULT_TIMEZONE = ZoneInfo(DEFAULT_TIMEZONE_NAME)
+except (ZoneInfoNotFoundError, ValueError):
+    DEFAULT_TIMEZONE = None
 DEPRECATED_WRITE_PREVIEW_VARS = tuple(
     name
     for name in (
@@ -92,6 +101,7 @@ READ_TOOL_NAMES = {
 }
 WRITE_TOOL_NAMES = {
     "create_playlist",
+    "create_curated_playlist",
     "update_playlist",
     "add_to_playlist",
     "remove_from_playlist",
@@ -193,7 +203,7 @@ READ_TOOLS = [
     ),
     _tool(
         "get_recent_plays",
-        "Read actual recent song play events in upstream order, including per-play timestamps when NetEase supplies them. The upstream endpoint supports only a limit, not time-range or offset pagination.",
+        "Read actual recent song play events in upstream order. played_at and played_at_utc are UTC. For user-facing dates, clock times, and relative wording such as morning, evening, yesterday, or today, prefer played_at_local and interpret it using timezone; utc_offset is the offset at that instant. The endpoint supports only a limit, not time-range or offset pagination.",
         {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}},
     ),
     _tool(
@@ -241,13 +251,16 @@ READ_TOOLS = [
     ),
     _tool(
         "get_recent_podcast_plays",
-        "Read the recent podcast-program resources reported by NetEase, preserving upstream order and timestamps only when supplied. This is not guaranteed to be a complete event stream and does not provide a reliable per-user play count.",
+        "Read recent podcast-program resources in upstream order. played_at and played_at_utc are UTC; use played_at_local together with timezone for user-facing date, clock-time, and relative-time wording. This is not guaranteed to be a complete event stream and does not provide a reliable per-user play count.",
         {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}},
     ),
-    _tool("daily_recommend", "Get today's personalized song recommendations."),
+    _tool(
+        "daily_recommend",
+        "Get NetEase's personalized daily song feed without changing the legacy text result. MCP_DEFAULT_TIMEZONE affects only display and date-language context. NetEase supplies the feed and controls its refresh boundary; this server cannot change that boundary and does not infer today from the deployment host.",
+    ),
     _tool(
         "get_operation_log",
-        "Read sanitized, bounded operation audit records from persistent storage.",
+        "Read sanitized, bounded operation audit records. Legacy created_at and completed_at plus explicit *_utc fields are UTC; use *_local with the matching *_timezone for user-facing date, clock-time, and relative-time wording. Local fields are derived only when records are read.",
         {
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
             "offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -259,7 +272,7 @@ READ_TOOLS = [
     ),
     _tool(
         "list_interaction_notes",
-        "Read private plugin-owned notes for an accessible playlist. These are not native NetEase comments.",
+        "Read private plugin-owned notes for an accessible playlist. Legacy created_at, updated_at, and deleted_at plus explicit *_utc fields are UTC; use *_local with the matching *_timezone for user-facing time wording. These are not native NetEase comments.",
         {
             "playlist_id": {"type": "integer", "minimum": 1},
             "song_id": {"type": "integer", "minimum": 1},
@@ -282,6 +295,25 @@ WRITE_TOOLS = [
             "idempotency_key": _idempotency_schema(),
         },
         ["name"],
+        read_only=False,
+    ),
+    _tool(
+        "create_curated_playlist",
+        "Create a complete curated playlist in one audited operation. Validates 1-50 unique songs, creates the playlist, adds tracks, restores the caller's exact order, updates the description, and verifies the final metadata and tracks. Partial failures retain the playlist and return recovery details.",
+        {
+            "name": {"type": "string", "minLength": 1, "maxLength": 80},
+            "description": {"type": "string", "maxLength": 1000},
+            "privacy": {"type": "integer", "enum": [0, 10]},
+            "song_ids": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "minItems": 1,
+                "maxItems": 50,
+                "uniqueItems": True,
+            },
+            "idempotency_key": _idempotency_schema(),
+        },
+        ["name", "description", "privacy", "song_ids", "idempotency_key"],
         read_only=False,
     ),
     _tool(
@@ -442,6 +474,29 @@ class NetEaseError(RuntimeError):
 
 class UpstreamOutcomeUnknown(NetEaseError):
     """A mutating request may have reached upstream, but its result was not readable."""
+
+
+class CuratedPlaylistFailure(NetEaseError):
+    """Structured failure from the multi-stage curated-playlist workflow."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        completed: dict[str, bool],
+        playlist_id: int | None,
+        recovery: dict[str, Any],
+        after_state: dict[str, Any] | None = None,
+        outcome_unknown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.completed = dict(completed)
+        self.playlist_id = playlist_id
+        self.recovery = dict(recovery)
+        self.after_state = after_state
+        self.outcome_unknown = outcome_unknown
 
 
 def _require_cookie() -> None:
@@ -644,15 +699,70 @@ def _validate_iso8601(value: Any, field: str) -> str | None:
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _milliseconds_to_iso8601(value: Any) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        return None
-    try:
-        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat().replace(
-            "+00:00", "Z"
+def _configured_timezone() -> ZoneInfo:
+    if DEFAULT_TIMEZONE is None:
+        raise RuntimeError(
+            "MCP_DEFAULT_TIMEZONE must be a valid IANA timezone name."
         )
-    except (OverflowError, OSError, ValueError):
+    return DEFAULT_TIMEZONE
+
+
+def _format_utc_offset(value: datetime) -> str | None:
+    offset = value.utcoffset()
+    if offset is None:
         return None
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    total_seconds = abs(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    result = f"{sign}{hours:02d}:{minutes:02d}"
+    return f"{result}:{seconds:02d}" if seconds else result
+
+
+def _datetime_context(value: datetime | None) -> dict[str, Any]:
+    if value is None:
+        return {
+            "utc": None,
+            "local": None,
+            "timezone": DEFAULT_TIMEZONE_NAME,
+            "utc_offset": None,
+        }
+    utc_value = value.astimezone(timezone.utc)
+    local_value = utc_value.astimezone(_configured_timezone())
+    return {
+        "utc": utc_value.isoformat().replace("+00:00", "Z"),
+        "local": local_value.isoformat(),
+        "timezone": DEFAULT_TIMEZONE_NAME,
+        "utc_offset": _format_utc_offset(local_value),
+    }
+
+
+def _milliseconds_time_context(value: Any) -> dict[str, Any]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return _datetime_context(None)
+    try:
+        parsed = datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        parsed = None
+    return _datetime_context(parsed)
+
+
+def _iso8601_time_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str):
+        return _datetime_context(None)
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = None
+    return _datetime_context(parsed)
+
+
+def _milliseconds_to_iso8601(value: Any) -> str | None:
+    return _milliseconds_time_context(value)["utc"]
 
 
 def _playlist_detail(playlist_id: int) -> dict[str, Any]:
@@ -765,6 +875,7 @@ def _song_detail_payload(song: dict[str, Any]) -> dict[str, Any]:
     publish_time_ms = song.get("publishTime")
     if isinstance(publish_time_ms, bool) or not isinstance(publish_time_ms, int):
         publish_time_ms = None
+    release_time = _milliseconds_time_context(publish_time_ms)
     labels = _explicit_version_labels(song)
     normalized_labels = " ".join(labels).casefold()
     version_flags = {
@@ -785,7 +896,11 @@ def _song_detail_payload(song: dict[str, Any]) -> dict[str, Any]:
             "duration_ms": duration_ms,
             "duration_seconds": round(duration_ms / 1000, 3) if duration_ms is not None else None,
             "publish_time_ms": publish_time_ms,
-            "release_time": _milliseconds_to_iso8601(publish_time_ms),
+            "release_time": release_time["utc"],
+            "release_time_utc": release_time["utc"],
+            "release_time_local": release_time["local"],
+            "release_timezone": release_time["timezone"],
+            "release_utc_offset": release_time["utc_offset"],
             "aliases": _string_list(song.get("alia", song.get("alias"))),
             "translated_names": _string_list(song.get("tns")),
             "version_labels": labels,
@@ -989,6 +1104,7 @@ def get_recent_plays(limit: Any = 100) -> str:
             continue
         song = entry.get("data") if isinstance(entry.get("data"), dict) else {}
         play_time_ms = entry.get("playTime")
+        played_time = _milliseconds_time_context(play_time_ms)
         terminal = entry.get("multiTerminalInfo")
         if not isinstance(terminal, dict):
             terminal = {}
@@ -999,7 +1115,11 @@ def get_recent_plays(limit: Any = 100) -> str:
                 "play_time_ms": play_time_ms
                 if isinstance(play_time_ms, int) and not isinstance(play_time_ms, bool)
                 else None,
-                "played_at": _milliseconds_to_iso8601(play_time_ms),
+                "played_at": played_time["utc"],
+                "played_at_utc": played_time["utc"],
+                "played_at_local": played_time["local"],
+                "timezone": played_time["timezone"],
+                "utc_offset": played_time["utc_offset"],
                 "source_device": terminal.get("osText"),
                 "banned": entry.get("banned") if isinstance(entry.get("banned"), bool) else None,
             }
@@ -1012,6 +1132,8 @@ def get_recent_plays(limit: Any = 100) -> str:
             "returned": len(events),
             "upstream_total": raw_total if isinstance(raw_total, int) else None,
             "limit": limit,
+            "timezone": DEFAULT_TIMEZONE_NAME,
+            "legacy_played_at_semantics": "UTC; equivalent to played_at_utc",
             "events": events,
             "limitations": {
                 "time_range_supported": False,
@@ -1063,6 +1185,7 @@ def _pagination_payload(
 def _podcast_radio_payload(radio: dict[str, Any]) -> dict[str, Any]:
     creator = radio.get("dj") if isinstance(radio.get("dj"), dict) else {}
     create_time_ms = _upstream_int(radio.get("createTime"))
+    created_time = _milliseconds_time_context(create_time_ms)
     fee_scope = _upstream_int(radio.get("feeScope"))
     return {
         "resource_type": "podcast_radio",
@@ -1085,7 +1208,11 @@ def _podcast_radio_payload(radio: dict[str, Any]) -> dict[str, Any]:
             "NetEase public aggregate; not the current user's listening count."
         ),
         "created_time_ms": create_time_ms,
-        "created_at": _milliseconds_to_iso8601(create_time_ms),
+        "created_at": created_time["utc"],
+        "created_at_utc": created_time["utc"],
+        "created_at_local": created_time["local"],
+        "created_at_timezone": created_time["timezone"],
+        "created_at_utc_offset": created_time["utc_offset"],
         "is_paid": fee_scope != 0 if fee_scope is not None else None,
     }
 
@@ -1101,6 +1228,7 @@ def _podcast_program_payload(program: dict[str, Any]) -> dict[str, Any]:
     if duration_ms is None:
         duration_ms = _upstream_int(main_song.get("duration"))
     create_time_ms = _upstream_int(program.get("createTime"))
+    published_time = _milliseconds_time_context(create_time_ms)
     return {
         "resource_type": "podcast_program",
         "program_id": _upstream_positive_id(program.get("id")),
@@ -1124,7 +1252,11 @@ def _podcast_program_payload(program: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": duration_ms,
         "duration_seconds": round(duration_ms / 1000, 3) if duration_ms is not None else None,
         "published_time_ms": create_time_ms,
-        "published_at": _milliseconds_to_iso8601(create_time_ms),
+        "published_at": published_time["utc"],
+        "published_at_utc": published_time["utc"],
+        "published_at_local": published_time["local"],
+        "published_at_timezone": published_time["timezone"],
+        "published_at_utc_offset": published_time["utc_offset"],
         "serial_number": _upstream_int(program.get("serialNum")),
         "program_type": program.get("type"),
         "public_listener_count": _upstream_int(program.get("listenerCount")),
@@ -1310,6 +1442,7 @@ def get_recent_podcast_plays(limit: Any = 50) -> str:
         if program["program_id"] is None:
             program["program_id"] = _upstream_positive_id(entry.get("resourceId"))
         play_time_ms = _upstream_int(entry.get("playTime"))
+        played_time = _milliseconds_time_context(play_time_ms)
         terminal = entry.get("multiTerminalInfo")
         if not isinstance(terminal, dict):
             terminal = {}
@@ -1317,7 +1450,11 @@ def get_recent_podcast_plays(limit: Any = 50) -> str:
             {
                 **program,
                 "play_time_ms": play_time_ms,
-                "played_at": _milliseconds_to_iso8601(play_time_ms),
+                "played_at": played_time["utc"],
+                "played_at_utc": played_time["utc"],
+                "played_at_local": played_time["local"],
+                "timezone": played_time["timezone"],
+                "utc_offset": played_time["utc_offset"],
                 "source_device": terminal.get("osText"),
             }
         )
@@ -1330,6 +1467,8 @@ def get_recent_podcast_plays(limit: Any = 50) -> str:
             "returned": len(records),
             "upstream_total": _upstream_int(raw_total),
             "limit": limit,
+            "timezone": DEFAULT_TIMEZONE_NAME,
+            "legacy_played_at_semantics": "UTC; equivalent to played_at_utc",
             "records": records,
             "personal_play_count_supported": False,
             "limitations": {
@@ -1510,6 +1649,316 @@ def reorder_playlist_tracks(playlist_id: Any, song_ids: Any) -> str:
     )
 
 
+def _curated_playlist_snapshot(playlist_id: int) -> dict[str, Any]:
+    playlist = _playlist_detail(playlist_id)
+    track_ids, track_count = _playlist_track_ids(playlist)
+    creator = playlist.get("creator")
+    creator_id = creator.get("userId") if isinstance(creator, dict) else None
+    privacy = playlist.get("privacy")
+    return {
+        "playlist_id": playlist_id,
+        "creator_id": creator_id,
+        "name": playlist.get("name"),
+        "description": playlist.get("description") or "",
+        "privacy": privacy
+        if isinstance(privacy, int) and not isinstance(privacy, bool)
+        else None,
+        "track_ids": track_ids,
+        "track_count": track_count,
+    }
+
+
+def _curated_recovery(
+    stage: str, playlist_id: int | None, completed: dict[str, bool]
+) -> dict[str, Any]:
+    recovery: dict[str, Any] = {
+        "automatic_rollback_attempted": False,
+        "automatic_rollback_available": False,
+        "same_idempotency_key_will_not_repeat_writes": True,
+    }
+    if playlist_id is None:
+        recovery.update(
+            {
+                "playlist_retained": False,
+                "next_action": (
+                    "Inspect the error. If the input was invalid, correct it and use a new "
+                    "idempotency_key. If creation had an unknown outcome, inspect the account "
+                    "before attempting another creation."
+                ),
+            }
+        )
+        return recovery
+
+    recovery.update(
+        {
+            "playlist_retained": True,
+            "playlist_id": playlist_id,
+            "next_action": (
+                "Inspect the retained playlist with get_playlist_songs, then resume it with the "
+                "existing low-level add_to_playlist, reorder_playlist_tracks, or update_playlist "
+                "tools as indicated by completed. Do not rerun this full workflow with a new key "
+                "unless a second playlist is intentional."
+            ),
+            "suggested_tools": [
+                "get_playlist_songs",
+                "add_to_playlist",
+                "reorder_playlist_tracks",
+                "update_playlist",
+            ],
+        }
+    )
+    if stage == "updating_description" and completed.get("order_restored"):
+        recovery["suggested_tools"] = ["update_playlist", "get_playlist_songs"]
+    elif stage == "verifying_final_state":
+        recovery["suggested_tools"] = [
+            "get_playlist_songs",
+            "reorder_playlist_tracks",
+            "update_playlist",
+        ]
+    return recovery
+
+
+def _raise_curated_failure(
+    exc: Exception,
+    *,
+    stage: str,
+    completed: dict[str, bool],
+    playlist_id: int | None,
+    after_state: dict[str, Any] | None = None,
+    outcome_unknown: bool = False,
+) -> None:
+    raise CuratedPlaylistFailure(
+        _redact_secrets(exc),
+        stage=stage,
+        completed=completed,
+        playlist_id=playlist_id,
+        recovery=_curated_recovery(stage, playlist_id, completed),
+        after_state=after_state,
+        outcome_unknown=outcome_unknown or isinstance(exc, UpstreamOutcomeUnknown),
+    ) from None
+
+
+def _execute_curated_playlist_action(
+    arguments: dict[str, Any],
+    user_id: int,
+    mark_upstream_action_started: Callable[[], None],
+) -> dict[str, Any]:
+    completed = {
+        "songs_validated": False,
+        "playlist_created": False,
+        "add_request_accepted": False,
+        "songs_added": False,
+        "order_restored": False,
+        "description_updated": False,
+        "final_state_verified": False,
+    }
+    playlist_id: int | None = None
+    last_state: dict[str, Any] | None = None
+
+    try:
+        songs = _fetch_song_records(arguments["song_ids"])
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="validating_songs",
+            completed=completed,
+            playlist_id=None,
+        )
+    recognized_ids = {
+        song.get("id")
+        for song in songs
+        if isinstance(song, dict)
+        and isinstance(song.get("id"), int)
+        and not isinstance(song.get("id"), bool)
+    }
+    missing_ids = [
+        song_id for song_id in arguments["song_ids"] if song_id not in recognized_ids
+    ]
+    if missing_ids:
+        _raise_curated_failure(
+            ValueError(f"NetEase did not recognize song IDs: {missing_ids}."),
+            stage="validating_songs",
+            completed=completed,
+            playlist_id=None,
+        )
+    completed["songs_validated"] = True
+
+    try:
+        mark_upstream_action_started()
+        response = netease_request(
+            "https://music.163.com/api/playlist/create?csrf_token=" + get_csrf(),
+            data={
+                "name": arguments["name"],
+                "privacy": str(arguments["privacy"]),
+                "type": "NORMAL",
+                "description": arguments["description"],
+            },
+        )
+        _raise_for_upstream_code(response, "Playlist creation failed.")
+        playlist = (
+            response.get("playlist")
+            if isinstance(response.get("playlist"), dict)
+            else {}
+        )
+        raw_playlist_id = playlist.get("id")
+        if (
+            isinstance(raw_playlist_id, str)
+            and raw_playlist_id.isascii()
+            and raw_playlist_id.isdigit()
+        ):
+            raw_playlist_id = int(raw_playlist_id)
+        if (
+            isinstance(raw_playlist_id, bool)
+            or not isinstance(raw_playlist_id, int)
+            or raw_playlist_id < 1
+        ):
+            _raise_curated_failure(
+                UpstreamOutcomeUnknown(
+                    "NetEase accepted playlist creation but did not return a usable playlist ID."
+                ),
+                stage="creating_playlist",
+                completed=completed,
+                playlist_id=None,
+                outcome_unknown=True,
+            )
+        playlist_id = raw_playlist_id
+        completed["playlist_created"] = True
+    except CuratedPlaylistFailure:
+        raise
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="creating_playlist",
+            completed=completed,
+            playlist_id=None,
+        )
+
+    try:
+        manipulate_playlist("add", playlist_id, arguments["song_ids"])
+        completed["add_request_accepted"] = True
+        last_state = _curated_playlist_snapshot(playlist_id)
+        actual_ids = last_state["track_ids"]
+        missing_after_add = [
+            song_id for song_id in arguments["song_ids"] if song_id not in actual_ids
+        ]
+        unexpected_after_add = [
+            song_id for song_id in actual_ids if song_id not in arguments["song_ids"]
+        ]
+        if (
+            missing_after_add
+            or unexpected_after_add
+            or len(actual_ids) != len(arguments["song_ids"])
+            or last_state["track_count"] != len(arguments["song_ids"])
+        ):
+            raise NetEaseError(
+                "NetEase returned an inconsistent playlist after adding songs: "
+                f"missing={missing_after_add}, unexpected={unexpected_after_add}, "
+                f"track_count={last_state['track_count']}."
+            )
+        completed["songs_added"] = True
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="adding_songs",
+            completed=completed,
+            playlist_id=playlist_id,
+            after_state=last_state
+            or {
+                "playlist_id": playlist_id,
+                "state_readable": False,
+                "track_state": "unknown_after_add_attempt",
+            },
+        )
+
+    reordered = last_state["track_ids"] != arguments["song_ids"]
+    try:
+        if reordered:
+            reorder_playlist_tracks(playlist_id, arguments["song_ids"])
+            last_state = {
+                **last_state,
+                "track_ids": list(arguments["song_ids"]),
+                "track_count": len(arguments["song_ids"]),
+            }
+        completed["order_restored"] = True
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="reordering_tracks",
+            completed=completed,
+            playlist_id=playlist_id,
+            after_state=last_state,
+        )
+
+    try:
+        update_playlist(playlist_id, description=arguments["description"])
+        completed["description_updated"] = True
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="updating_description",
+            completed=completed,
+            playlist_id=playlist_id,
+            after_state=last_state,
+        )
+
+    try:
+        final_state = _curated_playlist_snapshot(playlist_id)
+    except Exception as exc:
+        _raise_curated_failure(
+            exc,
+            stage="verifying_final_state",
+            completed=completed,
+            playlist_id=playlist_id,
+            after_state=last_state,
+        )
+    final_ids = final_state["track_ids"]
+    verification = {
+        "name": final_state["name"] == arguments["name"],
+        "description": final_state["description"] == arguments["description"],
+        "song_set": set(final_ids) == set(arguments["song_ids"]),
+        "song_count": (
+            len(final_ids) == len(arguments["song_ids"])
+            and final_state["track_count"] == len(arguments["song_ids"])
+        ),
+        "song_order": final_ids == arguments["song_ids"],
+        "privacy": (
+            None
+            if final_state["privacy"] is None
+            else final_state["privacy"] == arguments["privacy"]
+        ),
+        "ownership": (
+            None
+            if final_state["creator_id"] is None
+            else str(final_state["creator_id"]) == str(user_id)
+        ),
+    }
+    failed_checks = [
+        field for field, passed in verification.items() if passed is False
+    ]
+    if failed_checks:
+        _raise_curated_failure(
+            NetEaseError(
+                "Final playlist verification failed for: "
+                + ", ".join(failed_checks)
+                + "."
+            ),
+            stage="verifying_final_state",
+            completed=completed,
+            playlist_id=playlist_id,
+            after_state=final_state,
+        )
+    completed["final_state_verified"] = True
+    return {
+        "success": True,
+        "stage": "completed",
+        "playlist_id": playlist_id,
+        "completed": completed,
+        "reordered_after_add": reordered,
+        "verification": verification,
+        "final_state": final_state,
+    }
+
+
 def like_song(song_id: Any, like: Any = True) -> str:
     song_id = _positive_int(song_id, "song_id")
     if not isinstance(like, bool):
@@ -1569,6 +2018,9 @@ def _accessible_playlist(playlist_id: int) -> tuple[int, dict[str, Any], list[in
 def _note_snapshot(note: dict[str, Any] | None) -> dict[str, Any] | None:
     if note is None:
         return None
+    created_time = _iso8601_time_context(note.get("created_at"))
+    updated_time = _iso8601_time_context(note.get("updated_at"))
+    deleted_time = _iso8601_time_context(note.get("deleted_at"))
     return {
         "note_id": note.get("note_id"),
         "playlist_id": note.get("playlist_id"),
@@ -1577,9 +2029,21 @@ def _note_snapshot(note: dict[str, Any] | None) -> dict[str, Any] | None:
         "content": note.get("content"),
         "visibility": note.get("visibility"),
         "created_at": note.get("created_at"),
+        "created_at_utc": created_time["utc"],
+        "created_at_local": created_time["local"],
+        "created_at_timezone": created_time["timezone"],
+        "created_at_utc_offset": created_time["utc_offset"],
         "updated_at": note.get("updated_at"),
+        "updated_at_utc": updated_time["utc"],
+        "updated_at_local": updated_time["local"],
+        "updated_at_timezone": updated_time["timezone"],
+        "updated_at_utc_offset": updated_time["utc_offset"],
         "version": note.get("version"),
         "deleted_at": note.get("deleted_at"),
+        "deleted_at_utc": deleted_time["utc"],
+        "deleted_at_local": deleted_time["local"],
+        "deleted_at_timezone": deleted_time["timezone"],
+        "deleted_at_utc_offset": deleted_time["utc_offset"],
     }
 
 
@@ -1630,7 +2094,19 @@ def _normalize_write_arguments(operation: str, arguments: Any) -> dict[str, Any]
         for key, value in arguments.items()
         if key not in {"preview_token", "idempotency_key"}
     }
-    if operation == "create_playlist":
+    if operation == "create_curated_playlist":
+        missing_fields = [
+            field
+            for field in ("name", "description", "privacy", "song_ids")
+            if field not in arguments
+        ]
+        if missing_fields:
+            raise ValueError(
+                "create_curated_playlist requires: "
+                + ", ".join(missing_fields)
+                + "."
+            )
+    if operation in {"create_playlist", "create_curated_playlist"}:
         name = arguments.get("name")
         description = arguments.get("description", "")
         privacy = arguments.get("privacy", 10)
@@ -1638,9 +2114,19 @@ def _normalize_write_arguments(operation: str, arguments: Any) -> dict[str, Any]
             raise ValueError("name must be between 1 and 80 characters.")
         if not isinstance(description, str) or len(description) > 1000:
             raise ValueError("description must be a string up to 1000 characters.")
-        if privacy not in (0, 10):
+        if isinstance(privacy, bool) or privacy not in (0, 10):
             raise ValueError("privacy must be 0 (public) or 10 (private).")
-        return {"name": name.strip(), "description": description, "privacy": privacy}
+        normalized = {
+            "name": name.strip(),
+            "description": description,
+            "privacy": privacy,
+        }
+        if operation == "create_curated_playlist":
+            ids = _song_ids(arguments.get("song_ids"))
+            if len(set(ids)) != len(ids):
+                raise ValueError("song_ids must not contain duplicates.")
+            normalized["song_ids"] = ids
+        return normalized
     if operation == "update_playlist":
         playlist_id = _positive_int(arguments.get("playlist_id"), "playlist_id")
         has_name = "name" in arguments
@@ -1730,7 +2216,7 @@ def _normalize_write_arguments(operation: str, arguments: Any) -> dict[str, Any]
 def _current_state_for_operation(
     operation: str, arguments: dict[str, Any], user_id: int
 ) -> dict[str, Any] | None:
-    if operation == "create_playlist":
+    if operation in {"create_playlist", "create_curated_playlist"}:
         return None
     if operation == "update_playlist":
         return _owned_playlist_state(arguments["playlist_id"], "metadata")
@@ -1795,6 +2281,15 @@ def _build_operation_plan(
     if operation == "create_playlist":
         target = {"resource_type": "playlist", "playlist_id": None}
         expected_after = dict(normalized)
+    elif operation == "create_curated_playlist":
+        target = {"resource_type": "curated_playlist", "playlist_id": None}
+        expected_after = {
+            "name": normalized["name"],
+            "description": normalized["description"],
+            "privacy": normalized["privacy"],
+            "track_ids": list(normalized["song_ids"]),
+            "track_count": len(normalized["song_ids"]),
+        }
     elif operation == "update_playlist":
         target = {"resource_type": "playlist", "playlist_id": normalized["playlist_id"]}
         expected_after = dict(before_state or {})
@@ -1927,6 +2422,8 @@ def get_operation_log(
     )
     public_records = []
     for record in records:
+        created_time = _iso8601_time_context(record.get("created_at"))
+        completed_time = _iso8601_time_context(record.get("completed_at"))
         public_records.append(
             {
                 "operation_id": record.get("operation_id"),
@@ -1934,7 +2431,15 @@ def get_operation_log(
                 "sanitized_arguments": record.get("sanitized_arguments"),
                 "target": record.get("target"),
                 "created_at": record.get("created_at"),
+                "created_at_utc": created_time["utc"],
+                "created_at_local": created_time["local"],
+                "created_at_timezone": created_time["timezone"],
+                "created_at_utc_offset": created_time["utc_offset"],
                 "completed_at": record.get("completed_at"),
+                "completed_at_utc": completed_time["utc"],
+                "completed_at_local": completed_time["local"],
+                "completed_at_timezone": completed_time["timezone"],
+                "completed_at_utc_offset": completed_time["utc_offset"],
                 "status": record.get("status"),
                 "before_state": record.get("before"),
                 "after_state": record.get("after"),
@@ -1948,6 +2453,12 @@ def get_operation_log(
         {
             "storage": "persistent_sqlite",
             "retention": {"days": OPERATION_RETENTION_DAYS, "maximum_records": MAX_OPERATION_LOGS},
+            "timestamp_storage": "UTC",
+            "timezone": DEFAULT_TIMEZONE_NAME,
+            "legacy_timestamp_semantics": (
+                "created_at and completed_at remain UTC for compatibility; "
+                "use the explicit *_utc and *_local fields for display."
+            ),
             "limit": limit,
             "offset": offset,
             "returned": len(public_records),
@@ -2086,6 +2597,12 @@ def _execute_operation_action(
             "description": playlist.get("description", arguments["description"]),
             "privacy": arguments["privacy"],
         }
+    if operation == "create_curated_playlist":
+        return _execute_curated_playlist_action(
+            arguments,
+            user_id,
+            mark_upstream_action_started,
+        )
     if operation == "update_playlist":
         mark_upstream_action_started()
         message = update_playlist(
@@ -2253,6 +2770,8 @@ def _after_state_for_operation(
 ) -> Any:
     if operation == "create_playlist":
         return result
+    if operation == "create_curated_playlist":
+        return (result or {}).get("final_state")
     if operation in {"create_interaction_note", "update_interaction_note", "delete_interaction_note"}:
         return (result or {}).get("note")
     if operation == "undo_operation":
@@ -2297,6 +2816,16 @@ def _idempotent_operation_replay(
     result.setdefault("status", status)
     if status == "success":
         return _json_text(result)
+    if record.get("operation") == "create_curated_playlist":
+        result["success"] = False
+        result["idempotent_replay"] = True
+        result["retry_suppressed"] = True
+        recovery = dict(result.get("recovery") or {})
+        recovery["same_key_behavior"] = (
+            "No write was repeated. Inspect or recover the recorded playlist state."
+        )
+        result["recovery"] = recovery
+        raise NetEaseError(_json_text(result))
     error = record.get("error_summary") or (
         "The previous result is unknown and was not retried."
         if status == "unknown"
@@ -2459,17 +2988,26 @@ def _execute_audited_write(
         if existing and existing.get("status") in {"conflict", "success"}:
             raise
         safe_error = _redact_secrets(exc)
+        curated_failure = (
+            exc if isinstance(exc, CuratedPlaylistFailure) else None
+        )
         if not upstream_action_started:
             status = "failed_before_upstream"
             after_state = plan.get("before")
         else:
-            after_state = _best_effort_after_state(operation, normalized, user_id)
+            after_state = (
+                curated_failure.after_state
+                if curated_failure is not None
+                else _best_effort_after_state(operation, normalized, user_id)
+            )
             changed = after_state is not None and _canonical_json(
                 after_state
             ) != _canonical_json(plan.get("before"))
             if changed:
                 status = "partial_success"
-            elif isinstance(exc, UpstreamOutcomeUnknown):
+            elif isinstance(exc, UpstreamOutcomeUnknown) or (
+                curated_failure is not None and curated_failure.outcome_unknown
+            ):
                 status = "unknown"
             else:
                 status = "failed"
@@ -2480,6 +3018,17 @@ def _execute_audited_write(
             "upstream_action_started": upstream_action_started,
             "error_summary": safe_error,
         }
+        if curated_failure is not None:
+            failure_result.update(
+                {
+                    "success": False,
+                    "stage": curated_failure.stage,
+                    "playlist_id": curated_failure.playlist_id,
+                    "completed": curated_failure.completed,
+                    "after_state": after_state,
+                    "recovery": curated_failure.recovery,
+                }
+            )
         _store().finish_operation(
             operation_id,
             status=status,
@@ -2491,6 +3040,8 @@ def _execute_audited_write(
             raise PermissionError(safe_error) from None
         if isinstance(exc, ValueError):
             raise ValueError(safe_error) from None
+        if curated_failure is not None:
+            raise NetEaseError(_json_text(failure_result)) from None
         raise NetEaseError(safe_error) from None
 
 
@@ -2499,6 +3050,7 @@ def _preflight_target_hint(
 ) -> dict[str, Any]:
     resource_types = {
         "create_playlist": "playlist",
+        "create_curated_playlist": "curated_playlist",
         "update_playlist": "playlist",
         "add_to_playlist": "playlist_tracks",
         "remove_from_playlist": "playlist_tracks",
@@ -2520,6 +3072,8 @@ def _preflight_target_hint(
 def _execute_direct_write(operation: str, raw_arguments: dict[str, Any]) -> str:
     normalized = _normalize_write_arguments(operation, raw_arguments)
     raw_idempotency_key = _clean_idempotency_key(raw_arguments.get("idempotency_key"))
+    if operation == "create_curated_playlist" and raw_idempotency_key is None:
+        raise ValueError("idempotency_key is required for create_curated_playlist.")
     idempotency_key = (
         _idempotency_key_hash(raw_idempotency_key)
         if raw_idempotency_key is not None
@@ -2679,6 +3233,10 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
                 "serverInfo": {"name": "netease-music-mcp-safe", "version": "4.0.0"},
                 "instructions": (
                     "Write tools execute in one call after parameter, ownership, and state checks. "
+                    "Use create_curated_playlist when name, description, privacy, and the final "
+                    "song order are known; it requires an idempotency_key and verifies the result. "
+                    f"UTC timestamps are retained and local display times use the configured IANA "
+                    f"timezone {DEFAULT_TIMEZONE_NAME}; deployment location is ignored. "
                     "They are audited with before/after state and are never automatically retried when "
                     "the upstream result is partial or unknown. Reuse an idempotency_key only for the "
                     "same intended write. Interaction notes are private plugin-owned data, not native "
@@ -3084,7 +3642,13 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/health":
-            self._json({"status": "ok", "mode": "read-only" if READ_ONLY else "read-write"})
+            self._json(
+                {
+                    "status": "ok",
+                    "mode": "read-only" if READ_ONLY else "read-write",
+                    "timezone": DEFAULT_TIMEZONE_NAME,
+                }
+            )
             return
         if oauth_enabled() and path in {
             "/.well-known/oauth-protected-resource",
@@ -3264,6 +3828,11 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_ACCESS_TOKEN before starting.")
     if MAX_REQUEST_BYTES < 1024:
         raise SystemExit("MCP_MAX_REQUEST_BYTES must be at least 1024.")
+    if not DEFAULT_TIMEZONE_NAME or DEFAULT_TIMEZONE is None:
+        raise SystemExit(
+            "MCP_DEFAULT_TIMEZONE must be a valid IANA timezone name, "
+            "for example Asia/Shanghai, America/New_York, or UTC."
+        )
     if DEPRECATED_WRITE_PREVIEW_VARS:
         LOG.warning(
             "Ignoring deprecated write-preview environment variables: %s. "
@@ -3306,10 +3875,11 @@ def main() -> None:
     validate_startup()
     server = ThreadingHTTPServer((HOST, PORT), MCPHandler)
     LOG.info(
-        "NetEase Music MCP listening on http://%s:%s/mcp (%s)",
+        "NetEase Music MCP listening on http://%s:%s/mcp (%s, timezone=%s)",
         HOST,
         PORT,
         "read-only" if READ_ONLY else "read-write",
+        DEFAULT_TIMEZONE_NAME,
     )
     try:
         server.serve_forever()
