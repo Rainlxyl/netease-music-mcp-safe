@@ -22,6 +22,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import Any, Callable
@@ -92,6 +93,8 @@ READ_TOOL_NAMES = {
     "get_recent_plays",
     "list_my_subscribed_podcasts",
     "get_podcast_programs",
+    "get_podcast_program",
+    "get_podcast_program_details",
     "search_podcasts",
     "search_podcast_programs",
     "get_recent_podcast_plays",
@@ -228,6 +231,32 @@ READ_TOOLS = [
             },
         },
         ["radio_id"],
+    ),
+    _tool(
+        "get_podcast_program",
+        "Get normalized metadata for one NetEase podcast program by program_id. An optional main_track_id is the program's audio carrier, not a normal song_id.",
+        {
+            "program_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "NetEase podcast program ID.",
+            }
+        },
+        ["program_id"],
+    ),
+    _tool(
+        "get_podcast_program_details",
+        "Get normalized metadata for multiple NetEase podcast programs by program_id. Input order and duplicate positions are preserved; one missing program does not discard other results.",
+        {
+            "program_ids": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "minItems": 1,
+                "maxItems": 50,
+                "description": "NetEase podcast program IDs. Input order is preserved.",
+            }
+        },
+        ["program_ids"],
     ),
     _tool(
         "search_podcasts",
@@ -470,6 +499,13 @@ WRITE_TOOLS = [
 
 class NetEaseError(RuntimeError):
     pass
+
+
+class PodcastProgramNotFound(NetEaseError):
+    code = "podcast_program_not_found"
+
+    def __init__(self) -> None:
+        super().__init__("podcast_program_not_found: Podcast program was not found.")
 
 
 class UpstreamOutcomeUnknown(NetEaseError):
@@ -1159,6 +1195,19 @@ def _upstream_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _podcast_program_ids(value: Any) -> list[int]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 50:
+        raise ValueError("program_ids must contain between 1 and 50 IDs.")
+    return [_positive_int(item, "program_id") for item in value]
+
+
+def _podcast_serial_number(value: Any, *, trusted: bool) -> int | None:
+    serial_number = _upstream_int(value)
+    if not trusted or serial_number is None or serial_number < 1:
+        return None
+    return serial_number
+
+
 def _clean_search_query(value: Any) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 200:
         raise ValueError("query must be between 1 and 200 characters.")
@@ -1217,7 +1266,9 @@ def _podcast_radio_payload(radio: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _podcast_program_payload(program: dict[str, Any]) -> dict[str, Any]:
+def _podcast_program_payload(
+    program: dict[str, Any], *, trust_serial_number: bool = True
+) -> dict[str, Any]:
     radio = program.get("radio") if isinstance(program.get("radio"), dict) else {}
     creator = program.get("dj") if isinstance(program.get("dj"), dict) else {}
     main_song = program.get("mainSong") if isinstance(program.get("mainSong"), dict) else {}
@@ -1257,7 +1308,9 @@ def _podcast_program_payload(program: dict[str, Any]) -> dict[str, Any]:
         "published_at_local": published_time["local"],
         "published_at_timezone": published_time["timezone"],
         "published_at_utc_offset": published_time["utc_offset"],
-        "serial_number": _upstream_int(program.get("serialNum")),
+        "serial_number": _podcast_serial_number(
+            program.get("serialNum"), trusted=trust_serial_number
+        ),
         "program_type": program.get("type"),
         "public_listener_count": _upstream_int(program.get("listenerCount")),
         "public_liked_count": _upstream_int(program.get("likedCount")),
@@ -1335,6 +1388,84 @@ def get_podcast_programs(
     )
 
 
+def _fetch_podcast_program(program_id: int) -> dict[str, Any]:
+    response = netease_request(
+        "https://music.163.com/api/dj/program/detail",
+        data={"id": str(program_id)},
+    )
+    if response.get("code") == 404:
+        raise PodcastProgramNotFound()
+    _raise_for_upstream_code(response, "Podcast program detail lookup failed.")
+    raw_program = response.get("program")
+    if not isinstance(raw_program, dict):
+        data = response.get("data")
+        raw_program = data.get("program") if isinstance(data, dict) else None
+    if not isinstance(raw_program, dict):
+        raise PodcastProgramNotFound()
+    program = _podcast_program_payload(raw_program)
+    if program["program_id"] != program_id:
+        raise NetEaseError("Podcast program detail lookup returned an unexpected resource.")
+    return program
+
+
+def get_podcast_program(program_id: Any) -> str:
+    program_id = _positive_int(program_id, "program_id")
+    return _json_text(_fetch_podcast_program(program_id))
+
+
+def _podcast_program_detail_result(program_id: int) -> dict[str, Any]:
+    try:
+        program = _fetch_podcast_program(program_id)
+    except PodcastProgramNotFound:
+        return {
+            "requested_program_id": program_id,
+            "found": False,
+            "program": None,
+            "error": {
+                "code": PodcastProgramNotFound.code,
+                "message": "Podcast program was not found.",
+            },
+        }
+    except Exception:
+        return {
+            "requested_program_id": program_id,
+            "found": False,
+            "program": None,
+            "error": {
+                "code": "podcast_program_lookup_failed",
+                "message": "Podcast program lookup failed.",
+            },
+        }
+    return {
+        "requested_program_id": program_id,
+        "found": True,
+        "program": program,
+        "error": None,
+    }
+
+
+def get_podcast_program_details(program_ids: Any) -> str:
+    requested_ids = _podcast_program_ids(program_ids)
+    unique_ids = list(dict.fromkeys(requested_ids))
+    max_workers = min(5, len(unique_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        unique_results = dict(
+            zip(
+                unique_ids,
+                executor.map(_podcast_program_detail_result, unique_ids),
+            )
+        )
+    programs = [unique_results[program_id] for program_id in requested_ids]
+    return _json_text(
+        {
+            "record_type": "podcast_program_detail_batch",
+            "requested": len(requested_ids),
+            "returned": sum(1 for item in programs if item["found"]),
+            "programs": programs,
+        }
+    )
+
+
 def _search_resources(response: dict[str, Any], legacy_key: str) -> tuple[list[Any], Any, Any]:
     data = response.get("data")
     if isinstance(data, dict) and isinstance(data.get("resources"), list):
@@ -1399,7 +1530,7 @@ def search_podcast_programs(query: Any, limit: Any = 20, offset: Any = 0) -> str
         if not isinstance(resource, dict):
             continue
         base = resource.get("baseInfo") if isinstance(resource.get("baseInfo"), dict) else resource
-        program = _podcast_program_payload(base)
+        program = _podcast_program_payload(base, trust_serial_number=False)
         if program["program_id"] is None:
             program["program_id"] = _upstream_positive_id(resource.get("resourceId"))
         programs.append(program)
@@ -1438,7 +1569,7 @@ def get_recent_podcast_plays(limit: Any = 50) -> str:
         raw_program = entry.get("data")
         if not isinstance(raw_program, dict):
             raw_program = entry.get("baseInfo") if isinstance(entry.get("baseInfo"), dict) else {}
-        program = _podcast_program_payload(raw_program)
+        program = _podcast_program_payload(raw_program, trust_serial_number=False)
         if program["program_id"] is None:
             program["program_id"] = _upstream_positive_id(entry.get("resourceId"))
         play_time_ms = _upstream_int(entry.get("playTime"))
@@ -3184,6 +3315,10 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
             arguments.get("offset", 0),
             arguments.get("order", "newest"),
         )
+    if name == "get_podcast_program":
+        return get_podcast_program(arguments.get("program_id"))
+    if name == "get_podcast_program_details":
+        return get_podcast_program_details(arguments.get("program_ids"))
     if name == "search_podcasts":
         return search_podcasts(
             arguments.get("query"),

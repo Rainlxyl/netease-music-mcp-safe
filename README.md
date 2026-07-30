@@ -21,7 +21,7 @@ Cloud Music account. It is derived from
 
 ## Available tools
 
-Read-only mode provides:
+Read-only mode provides 16 tools:
 
 - `search_song(query, limit=5)`: search without changing the account.
 - `list_my_playlists()`: list owned and collected playlists.
@@ -40,6 +40,10 @@ Read-only mode provides:
 - `list_my_subscribed_podcasts(limit=30, offset=0)`: list subscribed podcast/radio containers.
 - `get_podcast_programs(radio_id, limit=30, offset=0, order="newest")`: list programs/episodes in
   one podcast container. `order` may be `newest` or `oldest`.
+- `get_podcast_program(program_id)`: return normalized metadata for one podcast program.
+- `get_podcast_program_details(program_ids)`: return normalized metadata for 1–50 programs while
+  preserving input order and duplicate positions. One missing or failed program does not discard
+  the other results.
 - `search_podcasts(query, limit=20, offset=0)`: search podcast/radio containers.
 - `search_podcast_programs(query, limit=20, offset=0)`: search programs/episodes.
 - `get_recent_podcast_plays(limit=50)`: return recent podcast-program resources in upstream order,
@@ -90,19 +94,19 @@ text result. The MCP tool description explains that timezone configuration is on
 date-language context, NetEase selects the daily feed and controls its refresh boundary, and this
 server cannot change that boundary. The Zeabur host clock or region does not choose the feed.
 
-### Experimental podcast read-only dry run
+### Podcast read-only tools
 
-The five podcast tools above are an experimental, read-only dry-run surface. Their request and
-response handling is covered by synthetic fixtures with every network call mocked; this version has
-not read a real account. Before publishing it, test the authenticated response shapes with a
-non-sensitive account and review the normalized output. No podcast write action is included.
+The seven podcast tools are read-only. Subscription listing, container program listing, podcast and
+program search, and recent podcast plays have been exercised with a real account and online
+deployment. The two program-detail tools are registered and covered by automated tests. No podcast
+write action is included.
 
 NetEase uses several related but distinct objects. This server keeps their identifiers separate:
 
 - `radio_id` identifies the podcast/radio container (called `djRadio` or `voicelist` upstream);
 - `program_id` identifies a program/episode (called `program` or `voice` upstream);
-- `main_track_id`, when present, is NetEase's audio carrier for that program. It is deliberately not
-  returned as `song_id`, because a podcast program is not a normal song resource.
+- `main_track_id`, when present, is NetEase's audio carrier for that program. It is **not** a normal
+  `song_id` and must not be passed to song detail, song like, or playlist-track write tools.
 
 Example page request:
 
@@ -111,6 +115,16 @@ Example page request:
   "name": "get_podcast_programs",
   "arguments": {"radio_id": 123456, "limit": 20, "offset": 20, "order": "newest"}
 }
+```
+
+Use the program-detail batch tool to enrich recent podcast records:
+
+```text
+get_recent_podcast_plays
+→ collect records[].program_id
+→ get_podcast_program_details(program_ids=[...])
+→ merge each result by requested_program_id
+→ organize the timeline using played_at_local and timezone
 ```
 
 `radio.playCount` and `program.listenerCount` are normalized as
@@ -123,7 +137,9 @@ offer offset or time-range paging and is not documented as a complete per-play e
 server preserves the upstream order, emits `played_at` only from an actual `playTime`, and returns
 `personal_play_count_supported: false`. An unrecognized or aggregate-only response produces no fake
 events. The container-level recent-radio endpoint was investigated but is not exposed because it is
-less precise than the program-level endpoint.
+less precise than the program-level endpoint. Recent podcast plays are not a complete listening
+history, do not support arbitrary time ranges or offset pagination, and do not expose listening
+progress or whether an episode was finished.
 
 After deploying this version, refresh the app's action definitions and disconnect/reconnect the
 ChatGPT app before expecting the new podcast tool schemas to appear.

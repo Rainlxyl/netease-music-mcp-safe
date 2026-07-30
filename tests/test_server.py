@@ -101,6 +101,8 @@ class ToolTests(unittest.TestCase):
             "get_recent_plays": mock.DEFAULT,
             "list_my_subscribed_podcasts": mock.DEFAULT,
             "get_podcast_programs": mock.DEFAULT,
+            "get_podcast_program": mock.DEFAULT,
+            "get_podcast_program_details": mock.DEFAULT,
             "search_podcasts": mock.DEFAULT,
             "search_podcast_programs": mock.DEFAULT,
             "get_recent_podcast_plays": mock.DEFAULT,
@@ -446,6 +448,8 @@ class ToolTests(unittest.TestCase):
         expected = {
             "list_my_subscribed_podcasts",
             "get_podcast_programs",
+            "get_podcast_program",
+            "get_podcast_program_details",
             "search_podcasts",
             "search_podcast_programs",
             "get_recent_podcast_plays",
@@ -455,6 +459,12 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(tools[name]["annotations"]["readOnlyHint"])
             self.assertNotIn("song_id", tools[name]["inputSchema"]["properties"])
         self.assertIn("radio_id", tools["get_podcast_programs"]["inputSchema"]["properties"])
+        self.assertIn("program_id", tools["get_podcast_program"]["inputSchema"]["properties"])
+        detail_schema = tools["get_podcast_program_details"]["inputSchema"]["properties"][
+            "program_ids"
+        ]
+        self.assertEqual(detail_schema["minItems"], 1)
+        self.assertEqual(detail_schema["maxItems"], 50)
 
     def test_list_subscribed_podcasts_uses_pagination_and_public_count_labels(self):
         module = load_server("true")
@@ -499,6 +509,7 @@ class ToolTests(unittest.TestCase):
                     "mainTrackId": 9001,
                     "duration": 123000,
                     "createTime": 2000,
+                    "serialNum": 92,
                     "listenerCount": 77,
                 }
             ],
@@ -511,6 +522,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(program["main_track_id"], 9001)
         self.assertNotIn("song_id", program)
         self.assertEqual(program["public_listener_count"], 77)
+        self.assertEqual(program["serial_number"], 92)
         self.assertEqual(program["published_at"], "1970-01-01T00:00:02Z")
         self.assertEqual(program["published_at_utc"], program["published_at"])
         self.assertEqual(
@@ -540,7 +552,11 @@ class ToolTests(unittest.TestCase):
                     {
                         "resourceType": "voice",
                         "resourceId": "501",
-                        "baseInfo": {"name": "Episode", "radio": {"id": 101}},
+                        "baseInfo": {
+                            "name": "Episode",
+                            "radio": {"id": 101},
+                            "serialNum": 1585109780313,
+                        },
                     }
                 ],
             },
@@ -553,9 +569,162 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(radios["query"], "ambient")
         self.assertEqual(radios["podcasts"][0]["radio_id"], 101)
         self.assertEqual(programs["programs"][0]["program_id"], 501)
+        self.assertIsNone(programs["programs"][0]["serial_number"])
         self.assertNotIn("song_id", programs["programs"][0])
         self.assertIn("/api/search/voicelist/get", request.call_args_list[0].args[0])
         self.assertIn("/api/search/voice/get", request.call_args_list[1].args[0])
+
+    def test_get_podcast_program_returns_normalized_detail(self):
+        module = load_server("true")
+        response = {
+            "code": 200,
+            "program": {
+                "id": 2066305916,
+                "name": "Gleichnis",
+                "description": "Gleichnis",
+                "coverUrl": "https://example.test/cover.jpg",
+                "radio": {
+                    "id": 794591707,
+                    "name": "德语音乐剧浮士德Faust Ⅰ+Ⅱ-Die Rockoper",
+                },
+                "dj": {"userId": 304462499, "nickname": "慢慢moi_"},
+                "mainTrackId": 1433739795,
+                "duration": 179722,
+                "createTime": 1585109780313,
+                "serialNum": 92,
+                "listenerCount": 20259,
+                "likedCount": 27,
+                "commentCount": 6,
+                "shareCount": 2,
+            },
+        }
+        with mock.patch.object(module, "netease_request", return_value=response) as request:
+            program = json.loads(module.get_podcast_program(2066305916))
+        self.assertEqual(program["resource_type"], "podcast_program")
+        self.assertEqual(program["program_id"], 2066305916)
+        self.assertEqual(program["radio_id"], 794591707)
+        self.assertEqual(program["main_track_id"], 1433739795)
+        self.assertEqual(
+            program["main_track_semantics"],
+            "Audio carrier returned by NetEase; it is not exposed as a normal song_id.",
+        )
+        self.assertNotIn("song_id", program)
+        self.assertEqual(program["duration_seconds"], 179.722)
+        self.assertEqual(program["published_at"], "2020-03-25T04:16:20.313000Z")
+        self.assertEqual(program["published_at_utc"], program["published_at"])
+        self.assertEqual(
+            program["published_at_local"], "2020-03-25T12:16:20.313000+08:00"
+        )
+        self.assertEqual(program["published_at_timezone"], "Asia/Shanghai")
+        self.assertEqual(program["published_at_utc_offset"], "+08:00")
+        self.assertEqual(program["serial_number"], 92)
+        self.assertEqual(program["public_listener_count"], 20259)
+        self.assertIn("/api/dj/program/detail", request.call_args.args[0])
+        self.assertEqual(request.call_args.kwargs["data"], {"id": "2066305916"})
+
+    def test_get_podcast_program_normalizes_missing_fields_to_null(self):
+        module = load_server("true")
+        response = {"code": 200, "program": {"id": 501}}
+        with mock.patch.object(module, "netease_request", return_value=response):
+            program = json.loads(module.get_podcast_program(501))
+        for field in (
+            "radio_id",
+            "main_track_id",
+            "name",
+            "description",
+            "cover_url",
+            "radio_name",
+            "creator",
+            "duration_ms",
+            "duration_seconds",
+            "published_time_ms",
+            "published_at",
+            "published_at_utc",
+            "published_at_local",
+            "published_at_utc_offset",
+            "serial_number",
+            "program_type",
+            "public_listener_count",
+            "public_liked_count",
+            "public_comment_count",
+            "public_share_count",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(program[field])
+
+    def test_get_podcast_program_not_found_uses_structured_mcp_error(self):
+        module = load_server("true")
+        with mock.patch.object(
+            module, "netease_request", return_value={"code": 200}
+        ):
+            with self.assertRaises(module.PodcastProgramNotFound) as context:
+                module.get_podcast_program(999999999999)
+        self.assertEqual(context.exception.code, "podcast_program_not_found")
+        response = module.tool_error_response(1, str(context.exception))
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("podcast_program_not_found", response["result"]["content"][0]["text"])
+
+    def test_get_podcast_program_details_preserves_order_deduplicates_and_partially_succeeds(
+        self,
+    ):
+        module = load_server("true")
+
+        def response_for(_url, *, data):
+            program_id = int(data["id"])
+            if program_id == 501:
+                return {
+                    "code": 200,
+                    "program": {
+                        "id": 501,
+                        "name": "Found",
+                        "mainTrackId": 9001,
+                    },
+                }
+            if program_id == 999:
+                return {"code": 404}
+            raise module.NetEaseError(
+                "upstream failed with " + module.NETEASE_COOKIE + " Authorization: secret"
+            )
+
+        requested = [501, 999, 501, 502]
+        with mock.patch.object(
+            module, "netease_request", side_effect=response_for
+        ) as request:
+            payload = json.loads(module.get_podcast_program_details(requested))
+        self.assertEqual(payload["record_type"], "podcast_program_detail_batch")
+        self.assertEqual(payload["requested"], 4)
+        self.assertEqual(payload["returned"], 2)
+        self.assertEqual(
+            [item["requested_program_id"] for item in payload["programs"]], requested
+        )
+        self.assertEqual(
+            [item["found"] for item in payload["programs"]],
+            [True, False, True, False],
+        )
+        self.assertEqual(
+            payload["programs"][1]["error"]["code"], "podcast_program_not_found"
+        )
+        self.assertEqual(
+            payload["programs"][3]["error"]["code"],
+            "podcast_program_lookup_failed",
+        )
+        self.assertEqual(request.call_count, 3)
+        requested_upstream_ids = sorted(
+            int(call.kwargs["data"]["id"]) for call in request.call_args_list
+        )
+        self.assertEqual(requested_upstream_ids, [501, 502, 999])
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("MUSIC_U=test", serialized)
+        self.assertNotIn("Authorization: secret", serialized)
+
+    def test_get_podcast_program_details_validates_batch_size_before_network(self):
+        module = load_server("true")
+        with mock.patch.object(module, "netease_request") as request:
+            with self.assertRaises(ValueError):
+                module.get_podcast_program_details([])
+            with self.assertRaises(ValueError):
+                module.get_podcast_program_details(list(range(1, 52)))
+        request.assert_not_called()
 
     def test_recent_podcast_plays_preserve_order_without_faking_timestamps_or_counts(self):
         module = load_server("true")
@@ -618,6 +787,9 @@ class ToolTests(unittest.TestCase):
             lambda: module.list_my_subscribed_podcasts(1, -1),
             lambda: module.get_podcast_programs(0),
             lambda: module.get_podcast_programs(1, order="random"),
+            lambda: module.get_podcast_program(0),
+            lambda: module.get_podcast_program_details([]),
+            lambda: module.get_podcast_program_details([1] * 51),
             lambda: module.search_podcasts(" "),
             lambda: module.search_podcast_programs("x", limit=51),
             lambda: module.get_recent_podcast_plays(True),
