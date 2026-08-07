@@ -2,14 +2,125 @@
 
 > 把平台给出的零散推荐，整理成真正属于一个人的每日聆听体验。
 
-`netease-music-mcp-safe` 是一个连接 ChatGPT、Codex 与网易云音乐个人账户的
-Streamable HTTP MCP 服务。它默认只读，可选开启经过校验、审计和幂等保护的写入能力。
+An MCP server that connects ChatGPT and Codex to a NetEase Cloud Music account for music
+discovery, listening-context analysis, playlist curation, podcast reading, and carefully bounded
+account writes.
 
-项目派生自 [Vael-KY/netease-music-mcp](https://github.com/Vael-KY/netease-music-mcp)，
-依据 MIT License 发布。
+`netease-music-mcp-safe` 默认只读，可选开启经过校验、审计和幂等保护的写入能力；它让
+调用模型读取音乐上下文、解释选择，并把确认后的策展结果安全地写回个人账户。
+
+**一眼看懂：** **16 read tools + 12 write tools** · 日推 / 播放排行 / 近期播放 · 每日策展
+工作流 · 播客读取 · OAuth 2.1 + PKCE · 时区感知 · 幂等审计写入 · **88 项测试**
+
+**项目身份：** 这是一个个人维护的独立开源项目，派生自
+[Vael-KY/netease-music-mcp](https://github.com/Vael-KY/netease-music-mcp)，依据 MIT License
+发布；项目与网易公司没有隶属、合作或背书关系。它使用未公开的网易云 Web 接口，上游行为
+可能变化；部署者有责任保护自己的凭据。另见 [Security Policy](SECURITY.md)。
+
+## What can I do with it?
+
+### Curate today's recommendations
+
+一次典型的每日策展会：
+
+1. 用 `daily_recommend` 读取当天推荐；
+2. 用 `get_play_history` 了解长期偏好；
+3. 用 `get_recent_plays` 读取近期状态；
+4. 由调用模型结合长期偏好、近期收听和 `played_at_local` 设计主题、选择理由与曲序；
+5. 用一次 `create_curated_playlist` 调用创建并核验最终歌单。
+
+可以这样对 ChatGPT 或 Codex 说：
+
+> 请读取我今天的日推、长期播放排行和最近播放，从日推中策划一张 10–15 首的夜间散步
+> 歌单。结合 `played_at_local` 理解我最近的收听状态，解释选择和曲序，再用一个新的幂等键
+> 一次创建歌单。不要复述原始播放记录。
+
+### Understand a podcast program
+
+可以搜索播客或节目、列出订阅与节目单，并用 `get_podcast_program` 或
+`get_podcast_program_details` 补全单期元数据。示例：
+
+> 找出这个主题相关的播客节目，比较标题、节目简介与发布时间，并明确区分公开播放统计和
+> 我的个人收听数据；如果上游没有个人进度或播放次数，不要猜测。
+
+### Inspect or manage playlists
+
+可以列出自己的歌单、分页读取歌曲，并在明确开启写权限后创建歌单、更新名称或简介、增删和
+重排歌曲。示例：
+
+> 先列出我拥有的歌单并说明准备修改哪一张；只在我确认后更新简介，不要改变歌曲顺序。
+
+本服务不控制网易云客户端或设备播放音乐；播放控制不在当前能力范围内。
+
+## 架构概览
+
+```mermaid
+flowchart TB
+    Client["ChatGPT / Codex"]
+    Auth["OAuth 2.1 + PKCE<br/>or Bearer authentication"]
+    MCP["NetEase Music MCP<br/>one deployment = one NetEase account"]
+    Cookie["NETEASE_COOKIE<br/>deployment environment only"]
+    API["Unofficial NetEase Web API"]
+    SQLite["SQLite<br/>audit / private notes / idempotency<br/>does not store NETEASE_COOKIE"]
+    Timezone["MCP_DEFAULT_TIMEZONE<br/>user-facing time context"]
+    Region["Deployment region<br/>does not select user-facing timezone"]
+
+    Client --> Auth --> MCP
+    Cookie --> MCP
+    MCP --> API
+    MCP --> SQLite
+    Timezone --> MCP
+    Region -. does not determine .-> Timezone
+```
+
+`NETEASE_COOKIE` 只存在于服务端部署环境，SQLite 保存的是脱敏审计、私人备注和幂等状态，
+不保存网易云 Cookie。面向用户的本地时间由 `MCP_DEFAULT_TIMEZONE` 决定，部署地区或主机
+时区不会替用户选择日期语境。
+
+## Quick Start
+
+1. Fork 或 clone 本仓库。
+2. 只通过自己控制的浏览器和网易云账户会话准备自己的 `NETEASE_COOKIE`；不要把凭据交给
+   第三方网站，也不要发到聊天、截图或公开 issue。
+3. 以 `.env.example` 为配置清单填写自己的环境变量。仓库中的示例只有 placeholder；真实
+   `.env` 和 secrets **绝对不能 commit**。本服务不会自动加载 `.env`，请通过 shell、进程
+   管理器或部署平台把变量导入进程环境。
+4. 第一次运行保持 `MCP_READ_ONLY=true`，先验证搜索、歌单、历史、日推和播客读取。
+5. 按下文在本地运行，或部署到你自己的 Zeabur service；需要写入时，先理解写权限、持久
+   SQLite 和不可逆操作，再显式设置 `MCP_READ_ONLY=false`。
+6. 最后连接 ChatGPT 或 Codex，并在修改工具 schema 或 OAuth scope 后刷新连接。
+
+详细参数、运行命令和部署步骤见[配置与本地运行](#配置与本地运行)、
+[部署到 Zeabur](#部署到-zeabur)和[连接 ChatGPT 与 Codex](#连接-chatgpt-与-codex)。
+
+## 账户模型与安全分享
+
+> **当前架构：one deployment → one NetEase account。**
+
+`NETEASE_COOKIE` 是 server process 启动时读取的 deployment-level environment variable。
+OAuth 或 Bearer authentication 控制的是“谁能访问这个 MCP deployment”，不是为每位访问者
+建立独立网易云登录的多租户系统。
+
+因此：
+
+- 不建议多人共享同一个私人 deployment；
+- 分享项目时应分享 GitHub repository，而不是自己的 MCP password、Bearer token 或
+  `NETEASE_COOKIE`；
+- 朋友或其他使用者应部署自己的实例，并设置自己的 `NETEASE_COOKIE`；
+- 如果多人获得同一部署的访问权，他们实际访问和可能修改的是该部署所配置的同一个网易云
+  账户；
+- SQLite 中按网易云 user ID 隔离的审计与备注，不能把单账号 deployment 自动变成多账号
+  服务。
+
+真正的 multi-account / per-user credential architecture **尚未实现**，只能作为未来可能性，
+不能把当前实例当成面向多人托管的网易云账户服务。
 
 ## 目录
 
+- [What can I do with it?](#what-can-i-do-with-it)
+- [架构概览](#架构概览)
+- [Quick Start](#quick-start)
+- [账户模型与安全分享](#账户模型与安全分享)
 - [项目起点](#项目起点)
 - [从推荐列表到每日策展](#从推荐列表到每日策展)
 - [当前已实现](#当前已实现)
