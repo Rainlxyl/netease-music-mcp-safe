@@ -954,6 +954,18 @@ class PersistenceAuditAndCoverTests(unittest.TestCase):
             self.assertIn("idempotency_key", tools[name]["inputSchema"]["properties"])
             self.assertNotIn("preview_token", tools[name]["inputSchema"]["properties"])
 
+        with self.assertRaises(ValueError) as context:
+            self.module._execute_operation_action(
+                "update_playlist_cover",
+                {"playlist_id": 1},
+                {},
+                7,
+                "operation-id",
+                lambda: None,
+            )
+        self.assertIn("attach the image again and retry", str(context.exception))
+        self.assertNotIn("preview", str(context.exception).lower())
+
     def test_write_mode_startup_requires_persistent_storage_path(self):
         self.module.STORAGE_PATH = ""
         with self.assertRaisesRegex(SystemExit, "MCP_STORAGE_PATH"):
@@ -2397,6 +2409,27 @@ class OAuthHTTPTests(unittest.TestCase):
             self.post_json("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         self.assertEqual(context.exception.code, 401)
         self.assertIn("resource_metadata=", context.exception.headers["WWW-Authenticate"])
+
+        client = self.register()
+        verifier = "v" * 64
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        query = urllib.parse.urlencode(
+            {
+                "client_id": client["client_id"],
+                "redirect_uri": "https://client.example/callback",
+                "response_type": "code",
+                "scope": "netease.read netease.write",
+                "state": "state-write-description",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": "https://music.example.test/mcp",
+            }
+        )
+        with mock.patch.object(self.module, "OAUTH_SCOPE", "netease.read netease.write"):
+            with urllib.request.urlopen(self.base + "/authorize?" + query, timeout=2) as response:
+                page = response.read().decode()
+        self.assertIn("Writes execute as a single audited call", page)
+        self.assertNotIn("matching preview", page.lower())
 
     def test_authorization_code_pkce_and_refresh_flow(self):
         client = self.register()

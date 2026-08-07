@@ -2774,7 +2774,9 @@ def _execute_operation_action(
         artifact = preview.get("artifact")
         image_meta = preview.get("artifact_meta")
         if not isinstance(artifact, bytes) or not isinstance(image_meta, dict):
-            raise ValueError("The preview no longer contains the processed image; create a new preview.")
+            raise ValueError(
+                "The prepared write no longer contains the processed image; attach the image again and retry."
+            )
         mark_upstream_action_started()
         return _upload_playlist_cover(arguments["playlist_id"], artifact, image_meta)
     if operation == "create_interaction_note":
@@ -3731,7 +3733,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         access_text = (
             "Authorize access to read your NetEase music data and to create playlists, edit playlist "
             "names, descriptions, or covers; add, remove, or reorder playlist tracks; like or unlike songs; "
-            "and manage private plugin-owned notes. Writes require a short-lived matching preview. "
+            "and manage private plugin-owned notes. Writes execute as a single audited call after server-side validation. "
             "ChatGPT will still apply its confirmation settings before write actions."
             if write_requested
             else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
