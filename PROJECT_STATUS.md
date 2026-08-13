@@ -1,17 +1,19 @@
 # 项目状态
 
-最后更新：2026-08-07
+最后更新：2026-08-13
 状态维护者：项目协作者
 
 ## 当前阶段
 
-项目已完成一轮本地产品化收尾，处于**可恢复、可继续开发、尚未推送**的稳定 checkpoint。
-远端稳定基线仍是 `fac6c3c74aeaaf00b0b71a0e4d6d62e9b468eb1a`（Add podcast program detail tools）；本地在该基线上新增三笔边界清晰的收尾提交。
+项目已完成首次公开发布，处于 **v0.1.0 发布后的维护阶段**。截至 2026-08-13 的公开状态复核，
+GitHub `main`、本地审计开始前的 `main` 与正式 Release `v0.1.0` 均指向
+`beb6fa55c7bb0f500e9f0222c493b62fda0b96c5`（`docs: prepare project for public sharing`）。
+本地工作树在本次文档审计开始前为 clean；这里不把后续未提交文档改动描述为已发布。
 
 当前产品提供 **16 个 read tools / 12 个 write tools**。默认 `MCP_READ_ONLY=true`；写入采用
 single-call flow，并保留服务端校验、审计、幂等、失败分类和有限撤销能力。
 
-## 本轮 checkpoint
+## 2026-08-07 checkpoint（历史记录）
 
 - 修复 OAuth 授权页和封面错误信息中的 stale preview 用户可见文案；没有重新引入 preview flow。
 - 发布产品化 `README.md`，明确当前能力、未来设想、历史在线验证与测试证据边界。
@@ -21,7 +23,7 @@ single-call flow，并保留服务端校验、审计、幂等、失败分类和�
   `EXPERIMENTS.md`、`HANDOFF.md`、`docs/INCIDENT_TEMPLATE.md`、
   `docs/LESSONS_LEARNED.md`、`docs/PRODUCT_README_DRAFT.md`。
 
-本地 checkpoint 提交主题：
+该次 checkpoint 提交主题：
 
 1. `fix: remove stale write-preview wording`
 2. `docs: publish product-focused README`
