@@ -1,7 +1,18 @@
 # 项目状态
 
-最后更新：2026-08-13
+最后更新：2026-08-31
 状态维护者：项目协作者
+
+## 2026-08-31 continuity refresh
+
+- continuity closeout 前的 source baseline：`main` at `6726a1e2b41d`；除本文件外，`README.md` modified，3 份 `CODEX_FOR_OSS_*` Markdown untracked，0 staged。doc-only closeout 后以 Git 当前 HEAD 为准，这四份 active docs 必须继续 dirty。
+- 当前 active work 是 docs-only，但包含两个可分离主题：README 的 upstream/version attribution；Codex for OSS readiness/evidence/application draft。不得作为一个 mixed commit 处理。
+- README attribution 目前只到 **implemented in working tree**；没有提交或单独 acceptance 记录。
+- OSS 三份文档是 2026-08-13 的审计/草稿证据，application 明确 `DRAFT ONLY — NOT SUBMITTED`。其中 stars、forks、form fields 等时间敏感主张本轮未联网复核，当前只能视为 historical snapshot。
+- 当前产品代码、tests、真实 NetEase API、OAuth、deployment/runtime 均未在本轮重验。v0.1.0 与 88/88 测试只能按下文的 historical verified 边界引用。
+- 唯一下一步：Rain 先审阅 README attribution 的准确性和三份 OSS 草稿是否仍要保留；之后再分别决定两个 exact-file commit boundary。不要提交申请或扩大到产品新功能。
+
+以下 2026-08-13 内容保留为发布后维护与审计历史；与本节冲突时，以当前 Git/diff 和本节为准。
 
 ## 当前阶段
 
