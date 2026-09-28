@@ -31,3 +31,9 @@ session fields. Protect persistent-volume and backup access as credential access
 printed to logs or returned through MCP tools. This personal single-instance deployment does not add
 a second database-encryption key; service or platform administrators who can read both the volume
 and process environment are inside the deployment's trusted administrative boundary.
+
+The temporary browser QR page loads only NetEase-operated resources needed for an official
+interactive security challenge: the Yidun loader from `cstaticdun.126.net` and the device
+fingerprint script from `st.music.163.com`, with a narrowly scoped page-specific CSP. The challenge
+proof and device token stay in the in-memory QR attempt request path; they are not logged, returned
+through MCP, or written to SQLite. This integration does not automate or bypass the challenge.

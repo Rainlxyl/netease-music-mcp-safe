@@ -103,6 +103,23 @@ QR_LOGIN_ATTEMPTS: dict[str, dict[str, Any]] = {}
 QR_LOGIN_LOCK = threading.Lock()
 QR_LOGIN_TTL_SECONDS = 10 * 60
 QR_LOGIN_MIN_CHECK_SECONDS = 2
+NETEASE_YIDUN_CAPTCHA_ID = "73a18dc827b24b18ad0783701a75277d"
+NETEASE_DEVICE_APP_ID = "9d0ef7e0905d422cba1ecf7e73d77e67"
+NETEASE_LOGIN_CSP = (
+    "default-src 'none'; img-src data: https://cstaticdun.126.net "
+    "https://cstaticdun1.126.net https://acstatic-dun.126.net "
+    "https://necaptcha.nosdn.127.net https://necaptcha1.nosdn.127.net "
+    "https://nos.netease.com https://c.dun.163.com https://c.dun.163yun.com; "
+    "style-src 'unsafe-inline'; script-src 'unsafe-inline' https://cstaticdun.126.net "
+    "https://cstaticdun1.126.net https://st.music.163.com "
+    "https://acstatic-dun.126.net; connect-src 'self' "
+    "https://c.dun.163.com "
+    "https://c.dun.163yun.com https://ac.dun.163.com https://ac.dun.163yun.com "
+    "https://ac-v6.dun.163yun.com https://c-v6.dun.163.com https://da.dun.163.com "
+    "https://interface.music.163.com; frame-src https://c.dun.163.com "
+    "https://c.dun.163yun.com https://ac.dun.163.com https://ac.dun.163yun.com; "
+    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+)
 
 
 READ_TOOL_NAMES = {
@@ -354,7 +371,7 @@ READ_TOOLS = [
     ),
     _tool(
         "check_netease_qr_login",
-        "Check one QR login attempt. Call only after the user has scanned or after the returned retry interval; confirmed sessions are persisted automatically.",
+        "Check one QR login attempt. Call only after the user has scanned or after the returned retry interval; confirmed sessions are persisted automatically. If verification_required is returned, the user must finish the official interactive challenge in the same browser login_url.",
         {
             "login_id": {
                 "type": "string",
@@ -951,7 +968,13 @@ def _cleanup_qr_attempts(now: float) -> None:
 def _discard_qr_attempt_locked(login_id: str) -> None:
     attempt = QR_LOGIN_ATTEMPTS.pop(login_id, None)
     if attempt is not None:
-        for name in ("key", "temporary_cookie", "yd_device_token", "chain_id"):
+        for name in (
+            "key",
+            "temporary_cookie",
+            "yd_device_token",
+            "chain_id",
+            "last_secure_captcha_digest",
+        ):
             attempt[name] = ""
 
 
@@ -1040,9 +1063,41 @@ def start_netease_qr_login() -> str:
     )
 
 
-def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
+def _ephemeral_qr_value(value: Any, field: str, *, allow_empty: bool) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string.")
+    normalized = value.strip()
+    if not normalized and not allow_empty:
+        raise ValueError(f"{field} must not be empty.")
+    if len(normalized) > 8192:
+        raise ValueError(f"{field} is too long.")
+    return normalized
+
+
+def _cancel_netease_qr_login(login_id: Any) -> dict[str, Any]:
+    if not isinstance(login_id, str) or not _valid_qr_login_id(login_id):
+        raise ValueError("login_id must be the value returned by start_netease_qr_login.")
+    with QR_LOGIN_LOCK:
+        _discard_qr_attempt_locked(login_id)
+    return {"login_id": login_id, "status": "cancelled"}
+
+
+def _check_netease_qr_login(
+    login_id: Any,
+    *,
+    secure_captcha: Any = None,
+    yd_device_token: Any = None,
+) -> dict[str, Any]:
     if not isinstance(login_id, str) or not 16 <= len(login_id) <= 100:
         raise ValueError("login_id must be the value returned by start_netease_qr_login.")
+    secure_captcha_value = _ephemeral_qr_value(
+        secure_captcha, "secure_captcha", allow_empty=False
+    )
+    yd_device_token_value = _ephemeral_qr_value(
+        yd_device_token, "yd_device_token", allow_empty=True
+    )
     now = time.monotonic()
     with QR_LOGIN_LOCK:
         _cleanup_qr_attempts(now)
@@ -1060,8 +1115,39 @@ def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
                 "throttled": True,
                 "retry_after_seconds": QR_LOGIN_MIN_CHECK_SECONDS,
             }
+        if (
+            attempt.get("status") == "verification_required"
+            and secure_captcha_value is None
+        ):
+            return {
+                "login_id": login_id,
+                "status": "verification_required",
+                "upstream_code": 8821,
+                "message": "Complete the official NetEase security challenge in the login page.",
+                "polling_paused": True,
+            }
+        if secure_captcha_value is not None:
+            if attempt.get("status") != "verification_required":
+                raise ValueError(
+                    "secure_captcha is only accepted after NetEase requests verification."
+                )
+            proof_digest = hashlib.sha256(secure_captcha_value.encode("utf-8")).hexdigest()
+            if attempt.get("last_secure_captcha_digest") == proof_digest:
+                return {
+                    "login_id": login_id,
+                    "status": "verification_required",
+                    "upstream_code": 8821,
+                    "message": "That security proof was already submitted; open the official challenge again.",
+                    "polling_paused": True,
+                    "challenge_retry_required": True,
+                }
+            attempt["last_secure_captcha_digest"] = proof_digest
         elapsed = now - float(attempt.get("last_checked_monotonic", 0))
-        if attempt.get("last_checked_monotonic") and elapsed < QR_LOGIN_MIN_CHECK_SECONDS:
+        if (
+            secure_captcha_value is None
+            and attempt.get("last_checked_monotonic")
+            and elapsed < QR_LOGIN_MIN_CHECK_SECONDS
+        ):
             return {
                 "login_id": login_id,
                 "status": attempt["status"],
@@ -1072,16 +1158,20 @@ def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
         attempt["checking"] = True
         key = str(attempt["key"])
         context = _qr_context(attempt)
+        current_device_token = yd_device_token_value or ""
 
     try:
+        payload = {
+            "key": key,
+            "type": 1,
+            "noCheckToken": True,
+            "ydDeviceToken": current_device_token,
+        }
+        if secure_captcha_value is not None:
+            payload["secureCaptcha"] = secure_captcha_value
         response, set_cookie_headers = _netease_qr_request(
             "/api/login/qrcode/client/login",
-            {
-                "key": key,
-                "type": 1,
-                "noCheckToken": True,
-                "ydDeviceToken": context["yd_device_token"],
-            },
+            payload,
             context,
             checking=True,
         )
@@ -1096,7 +1186,8 @@ def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
         801: "waiting",
         802: "scanned",
         803: "confirmed",
-        8821: "security_verification_required",
+        8821: "verification_required",
+        8830: "additional_security_verification_required",
     }
     status = statuses.get(code)
     if status is None:
@@ -1152,7 +1243,29 @@ def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
             else None,
         }
 
-    if status == "security_verification_required":
+    if status == "verification_required":
+        with QR_LOGIN_LOCK:
+            current = QR_LOGIN_ATTEMPTS.get(login_id)
+            if current is not None:
+                current["status"] = status
+                current["temporary_cookie"] = merged_temporary_cookie
+        return {
+            "login_id": login_id,
+            "status": status,
+            "upstream_code": code,
+            "message": _safe_qr_message(
+                response,
+                "NetEase requires the official interactive security challenge before this login can continue.",
+            ),
+            "polling_paused": True,
+            "login_url": (
+                PUBLIC_URL + "/netease/login/" + urllib.parse.quote(login_id, safe="")
+                if PUBLIC_URL
+                else None
+            ),
+        }
+
+    if status == "additional_security_verification_required":
         with QR_LOGIN_LOCK:
             _discard_qr_attempt_locked(login_id)
         return {
@@ -1161,7 +1274,7 @@ def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
             "upstream_code": code,
             "message": _safe_qr_message(
                 response,
-                "NetEase requires additional security verification; this login attempt cannot continue here.",
+                "NetEase requires further security verification that this QR flow cannot complete.",
             ),
             "polling_stopped": True,
             "next_tool": "start_netease_qr_login",
@@ -1213,26 +1326,103 @@ def _qr_login_page(login_id: str) -> str | None:
         "margin:0;background:#f6f7f9;color:#202124}.card{background:white;padding:2rem;"
         "border-radius:1rem;box-shadow:0 8px 30px #0001;text-align:center;max-width:28rem}"
         "img{width:min(72vw,300px);height:auto}.status{font-weight:600;margin-top:1rem}"
-        ".hint{color:#5f6368;line-height:1.5}</style></head><body><main class=\"card\">"
+        ".hint{color:#5f6368;line-height:1.5}.actions{display:flex;gap:.75rem;justify-content:center}"
+        "button{font:inherit;padding:.65rem 1rem;border:0;border-radius:.5rem;cursor:pointer}"
+        "#verify{background:#d43c33;color:white}#cancel{background:#e8eaed;color:#202124}"
+        "[hidden]{display:none!important}</style></head><body><main class=\"card\">"
         "<h1>网易云音乐登录</h1><p class=\"hint\">请使用网易云音乐 App 扫码并确认。</p>"
         f"<img alt=\"网易云登录二维码\" src=\"data:image/png;base64,{image_data}\">"
         "<p id=\"status\" class=\"status\">等待扫码</p>"
-        "<p id=\"hint\" class=\"hint\">页面会自动更新状态。</p></main><script>"
+        "<p id=\"hint\" class=\"hint\">页面会自动更新状态。</p>"
+        "<div id=\"captcha\"></div><div class=\"actions\">"
+        "<button id=\"verify\" type=\"button\" hidden>开始安全验证</button>"
+        "<button id=\"cancel\" type=\"button\">取消登录</button></div></main><script>"
         "const statusNode=document.getElementById('status');"
         "const hintNode=document.getElementById('hint');"
+        "const verifyButton=document.getElementById('verify');"
+        "const cancelButton=document.getElementById('cancel');"
         "const labels={waiting:'等待扫码',scanned:'已扫码，请在 App 中确认',"
         "confirmed:'登录成功，可以关闭页面',expired:'二维码已过期，请返回 ChatGPT 重新开始',"
-        "security_verification_required:'网易云要求额外安全验证，请返回 ChatGPT 重新开始',"
+        "verification_required:'网易云需要额外安全验证',"
+        "additional_security_verification_required:'网易云要求进一步安全验证，当前二维码无法继续',"
         "upstream_unknown:'网易云返回了暂不识别的状态，请返回 ChatGPT 查看详情'};"
-        "let stopped=false;async function poll(){if(stopped)return;try{"
-        "const response=await fetch(location.pathname.replace(/\\/$/,'')+'/status',"
-        "{cache:'no-store',credentials:'omit'});const data=await response.json();"
-        "statusNode.textContent=labels[data.status]||'正在检查';"
-        "if(['confirmed','expired','security_verification_required','upstream_unknown',"
-        "'invalid_or_expired'].includes(data.status)){stopped=true;hintNode.textContent="
-        "data.status==='confirmed'?'登录凭据已安全保存，浏览器未收到 Cookie。':'本页面已停止轮询。';}"
-        "}catch(_){statusNode.textContent='暂时无法检查，请稍候';}"
-        "if(!stopped)setTimeout(poll,2500);}setTimeout(poll,800);</script></body></html>"
+        "const endpoint=location.pathname.replace(/\\/$/,'')+'/status';"
+        f"const captchaId='{NETEASE_YIDUN_CAPTCHA_ID}';"
+        f"const deviceAppId='{NETEASE_DEVICE_APP_ID}';"
+        "let stopped=false,checking=false,timer=null,flowId=0,captcha=null,captchaTimer=null;"
+        "let yidunLoad=null,deviceLoad=null;"
+        "function loadScript(src,ready,kind){if(ready())return Promise.resolve();"
+        "let promise=kind==='yidun'?yidunLoad:deviceLoad;if(promise)return promise;"
+        "promise=new Promise((resolve,reject)=>{const script=document.createElement('script');"
+        "const timeout=setTimeout(()=>{script.remove();reject(new Error('sdk_timeout'));},7000);"
+        "script.src=src;script.async=true;script.onload=()=>{clearTimeout(timeout);"
+        "ready()?resolve():reject(new Error('sdk_unavailable'));};"
+        "script.onerror=()=>{clearTimeout(timeout);reject(new Error('sdk_load_failed'));};"
+        "document.head.appendChild(script);});"
+        "if(kind==='yidun'){yidunLoad=promise.catch(error=>{yidunLoad=null;throw error;});return yidunLoad;}"
+        "deviceLoad=promise.catch(error=>{deviceLoad=null;throw error;});return deviceLoad;}"
+        "function destroyCaptcha(){if(captchaTimer){clearTimeout(captchaTimer);captchaTimer=null;}"
+        "const currentCaptcha=captcha;captcha=null;if(currentCaptcha&&typeof currentCaptcha.destroy==='function'){"
+        "try{currentCaptcha.destroy();}catch(_){}}}"
+        "function finish(message){stopped=true;flowId++;checking=false;if(timer)clearTimeout(timer);"
+        "destroyCaptcha();verifyButton.hidden=true;cancelButton.hidden=true;if(message)hintNode.textContent=message;}"
+        "async function freshDeviceToken(){try{await loadScript("
+        "'https://st.music.163.com/device/signature/create/deviceid.js',"
+        "()=>typeof window.createNEFingerprint==='function','device');"
+        "const fingerprint=window.createNEFingerprint({appId:deviceAppId,timeout:6000});"
+        "const result=await Promise.race([fingerprint.getToken(),new Promise((_,reject)=>"
+        "setTimeout(()=>reject(new Error('device_timeout')),7000))]);"
+        "return result&&typeof result.token==='string'?result.token:'';}catch(_){return '';}}"
+        "async function requestStatus(proof){const body={yd_device_token:await freshDeviceToken()};"
+        "if(proof)body.secure_captcha=proof;const response=await fetch(endpoint,{method:'POST',"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify(body),cache:'no-store',"
+        "credentials:'omit'});return response.json();}"
+        "function schedule(){if(!stopped&&!timer)timer=setTimeout(()=>{timer=null;poll();},2500);}"
+        "function render(data){statusNode.textContent=labels[data.status]||'正在检查';"
+        "if(data.status==='verification_required'){verifyButton.hidden=false;"
+        "hintNode.textContent='普通轮询已暂停，请完成网易官方安全验证后继续。';return;}"
+        "verifyButton.hidden=true;if(data.status==='confirmed'){finish('登录凭据已安全保存，浏览器未收到 Cookie。');return;}"
+        "if(['expired','additional_security_verification_required','upstream_unknown',"
+        "'invalid_or_expired','cancelled'].includes(data.status)){finish('本页面已停止轮询。');return;}"
+        "hintNode.textContent='页面会自动更新状态。';schedule();}"
+        "async function poll(){if(stopped||checking)return;checking=true;const current=flowId;try{"
+        "const data=await requestStatus(null);if(current===flowId&&!stopped)render(data);"
+        "}catch(_){if(current===flowId&&!stopped){statusNode.textContent='暂时无法检查，请稍候';schedule();}}"
+        "finally{if(current===flowId)checking=false;}}"
+        "async function submitProof(validate,current){if(stopped||current!==flowId||checking)return;"
+        "checking=true;verifyButton.hidden=true;statusNode.textContent='正在提交安全验证';try{"
+        "const data=await requestStatus(validate);if(current===flowId&&!stopped)render(data);"
+        "}catch(_){if(current===flowId&&!stopped){statusNode.textContent='安全验证提交失败';"
+        "hintNode.textContent='请重新打开安全验证后重试。';verifyButton.hidden=false;}}"
+        "finally{if(current===flowId)checking=false;}}"
+        "async function openChallenge(){if(stopped||checking||captcha)return;"
+        "const current=flowId;verifyButton.hidden=true;statusNode.textContent='正在加载网易安全验证';"
+        "try{await loadScript('https://cstaticdun.126.net/load.min.js',"
+        "()=>typeof window.initNECaptcha==='function','yidun');if(stopped||current!==flowId)return;"
+        "await new Promise((resolve,reject)=>{let settled=false;captchaTimer=setTimeout(()=>{"
+        "if(!settled){settled=true;reject(new Error('captcha_init_timeout'));}},10000);"
+        "window.initNECaptcha({captchaId:captchaId,element:'#captcha',mode:'popup',width:'320px',"
+        "onVerify:(error,data)=>{if(stopped||current!==flowId)return;"
+        "const validate=!error&&data&&typeof data.validate==='string'?data.validate.trim():'';"
+        "if(!validate){destroyCaptcha();statusNode.textContent='安全验证未完成';hintNode.textContent='可以重新开始安全验证。';"
+        "verifyButton.hidden=false;return;}destroyCaptcha();submitProof(validate,current);},"
+        "onClose:()=>{if(stopped||current!==flowId)return;destroyCaptcha();"
+        "statusNode.textContent='安全验证已关闭';hintNode.textContent='二维码仍然有效，可以重新打开安全验证。';"
+        "verifyButton.hidden=false;},onError:()=>{if(stopped||current!==flowId)return;destroyCaptcha();"
+        "statusNode.textContent='安全验证组件不可用';hintNode.textContent='请检查网络后重试。';"
+        "verifyButton.hidden=false;}},instance=>{if(settled){if(instance&&instance.destroy)instance.destroy();return;}"
+        "settled=true;clearTimeout(captchaTimer);captchaTimer=null;captcha=instance;resolve();},"
+        "()=>{if(!settled){settled=true;clearTimeout(captchaTimer);captchaTimer=null;"
+        "reject(new Error('captcha_init_failed'));}});});"
+        "if(current===flowId&&!stopped){statusNode.textContent='请完成网易安全验证';"
+        "hintNode.textContent='验证完成后本页会继续同一个二维码登录。';if(captcha&&captcha.popUp)captcha.popUp();}"
+        "}catch(_){if(current===flowId&&!stopped){destroyCaptcha();statusNode.textContent='安全验证组件加载失败';"
+        "hintNode.textContent='请检查网络后重试。';verifyButton.hidden=false;}}}"
+        "verifyButton.addEventListener('click',openChallenge);cancelButton.addEventListener('click',()=>{"
+        "if(stopped)return;finish('登录已取消。');fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({cancel:true}),cache:'no-store',credentials:'omit',keepalive:true}).catch(()=>{});});"
+        "addEventListener('pagehide',()=>{flowId++;if(timer)clearTimeout(timer);destroyCaptcha();});"
+        "timer=setTimeout(()=>{timer=null;poll();},800);</script></body></html>"
     )
 
 
@@ -4331,7 +4521,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _html(self, content: str, status: int = 200) -> None:
+    def _html(
+        self,
+        content: str,
+        status: int = 200,
+        content_security_policy: str | None = None,
+    ) -> None:
         encoded = content.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -4341,9 +4536,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
-            "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
-            "base-uri 'none'; frame-ancestors 'none'",
+            content_security_policy
+            or (
+                "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
         )
         self.end_headers()
         self.wfile.write(encoded)
@@ -4490,7 +4688,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     HTTPStatus.GONE,
                 )
                 return
-            self._html(content)
+            self._html(content, content_security_policy=NETEASE_LOGIN_CSP)
             return
         if path == "/mcp":
             # This server is intentionally stateless and does not expose an SSE
@@ -4550,6 +4748,51 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+        login_status_route = re.fullmatch(
+            r"/netease/login/([A-Za-z0-9_-]{16,100})/status", path
+        )
+        if login_status_route:
+            login_id = login_status_route.group(1)
+            try:
+                payload = json.loads(self._read_body())
+                if not isinstance(payload, dict) or not set(payload).issubset(
+                    {"secure_captcha", "yd_device_token", "cancel"}
+                ):
+                    raise ValueError("invalid login status request")
+                if payload.get("cancel") is True:
+                    result = _cancel_netease_qr_login(login_id)
+                elif "cancel" in payload:
+                    raise ValueError("cancel must be true when supplied")
+                else:
+                    result = _check_netease_qr_login(
+                        login_id,
+                        secure_captcha=payload.get("secure_captcha"),
+                        yd_device_token=payload.get("yd_device_token"),
+                    )
+                self._json(result, headers={"Cache-Control": "no-store"})
+            except (ValueError, json.JSONDecodeError):
+                self._json(
+                    {"status": "invalid_request"},
+                    HTTPStatus.BAD_REQUEST,
+                    {"Cache-Control": "no-store"},
+                )
+            except NetEaseError as exc:
+                self._json(
+                    {"status": "upstream_error", "message": _redact_secrets(exc)},
+                    HTTPStatus.BAD_GATEWAY,
+                    {"Cache-Control": "no-store"},
+                )
+            except Exception as exc:
+                LOG.error(
+                    "Unhandled NetEase browser login failure (%s)",
+                    type(exc).__name__,
+                )
+                self._json(
+                    {"status": "internal_error"},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"Cache-Control": "no-store"},
+                )
+            return
         if oauth_enabled() and path == "/register":
             try:
                 payload = json.loads(self._read_body())

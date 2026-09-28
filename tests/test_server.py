@@ -4,7 +4,9 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -1184,6 +1186,7 @@ class NetEaseSessionTests(unittest.TestCase):
         self.assertEqual(check_call.args[1]["type"], 1)
         self.assertTrue(check_call.args[1]["noCheckToken"])
         self.assertEqual(check_call.args[1]["ydDeviceToken"], "")
+        self.assertNotIn("secureCaptcha", check_call.args[1])
         self.assertTrue(check_call.kwargs["checking"])
         self.assertEqual(
             check_call.args[2]["chain_id"], before["chain_id"]
@@ -1237,20 +1240,176 @@ class NetEaseSessionTests(unittest.TestCase):
         self.assertEqual(headers["x-login-chain-id"], context["chain_id"])
         self.assertEqual(headers["cookie"], context["temporary_cookie"])
 
-    def test_security_verification_status_stops_and_cleans_up(self):
+    def test_security_verification_pauses_and_preserves_attempt(self):
         self.configure_storage()
         login_id = "synthetic-security-login-id"
-        self.add_qr_attempt(login_id)
+        before = self.add_qr_attempt(login_id)
         with mock.patch.object(
             self.module,
             "_netease_qr_request",
-            return_value=({"code": 8821, "message": "security verification"}, []),
-        ):
+            return_value=(
+                {"code": 8821, "message": "security verification"},
+                ["WEVNSM=2.0.0; Path=/"],
+            ),
+        ) as request:
             result = json.loads(self.module.check_netease_qr_login(login_id))
-        self.assertEqual(result["status"], "security_verification_required")
+            paused = json.loads(self.module.check_netease_qr_login(login_id))
+        self.assertEqual(result["status"], "verification_required")
         self.assertEqual(result["upstream_code"], 8821)
+        self.assertTrue(result["polling_paused"])
+        self.assertEqual(paused["status"], "verification_required")
+        self.assertTrue(paused["polling_paused"])
+        self.assertEqual(request.call_count, 1)
+        after = self.module.QR_LOGIN_ATTEMPTS[login_id]
+        self.assertEqual(after["key"], before["key"])
+        self.assertEqual(after["chain_id"], before["chain_id"])
+        self.assertIn("WEVNSM=2.0.0", after["temporary_cookie"])
+
+    def test_security_proof_resumes_same_attempt_with_fresh_device_token(self):
+        self.configure_storage()
+        login_id = "synthetic-proof-resume-id"
+        attempt = self.add_qr_attempt(login_id, status="verification_required")
+        proof = "genuine-browser-validate-value"
+        device_token = "genuine-browser-device-token"
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 802}, []),
+        ) as request:
+            result = self.module._check_netease_qr_login(
+                login_id,
+                secure_captcha=proof,
+                yd_device_token=device_token,
+            )
+        self.assertEqual(result["status"], "scanned")
+        payload = request.call_args.args[1]
+        context = request.call_args.args[2]
+        self.assertEqual(payload["secureCaptcha"], proof)
+        self.assertEqual(payload["ydDeviceToken"], device_token)
+        self.assertEqual(payload["key"], attempt["key"])
+        self.assertEqual(context["chain_id"], attempt["chain_id"])
+        self.assertEqual(context["temporary_cookie"], attempt["temporary_cookie"])
+        self.assertNotIn("secure_captcha", self.module.QR_LOGIN_ATTEMPTS[login_id])
+        self.assertNotIn("yd_device_token", result)
+
+    def test_browser_device_token_is_request_scoped_not_cached_in_attempt(self):
+        self.configure_storage()
+        login_id = "synthetic-fresh-device-token-id"
+        attempt = self.add_qr_attempt(login_id)
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            side_effect=[({"code": 801}, []), ({"code": 802}, [])],
+        ) as request:
+            self.module._check_netease_qr_login(
+                login_id, yd_device_token="browser-device-token-one"
+            )
+            attempt["last_checked_monotonic"] = 0.0
+            self.module._check_netease_qr_login(
+                login_id, yd_device_token="browser-device-token-two"
+            )
+        self.assertEqual(
+            [call.args[1]["ydDeviceToken"] for call in request.call_args_list],
+            ["browser-device-token-one", "browser-device-token-two"],
+        )
+        self.assertEqual(attempt["yd_device_token"], "")
+
+    def test_security_proof_is_not_submitted_twice(self):
+        self.configure_storage()
+        login_id = "synthetic-proof-once-id"
+        self.add_qr_attempt(login_id, status="verification_required")
+        proof = "single-use-validate-value"
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 8821}, []),
+        ) as request:
+            first = self.module._check_netease_qr_login(
+                login_id, secure_captcha=proof, yd_device_token="first-device-token"
+            )
+            second = self.module._check_netease_qr_login(
+                login_id, secure_captcha=proof, yd_device_token="second-device-token"
+            )
+        self.assertEqual(first["status"], "verification_required")
+        self.assertTrue(second["challenge_retry_required"])
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn(proof, json.dumps(second))
+
+    def test_security_proof_is_rejected_before_8821(self):
+        login_id = "synthetic-early-proof-id"
+        self.add_qr_attempt(login_id, status="waiting")
+        with mock.patch.object(self.module, "_netease_qr_request") as request:
+            with self.assertRaises(ValueError) as context:
+                self.module._check_netease_qr_login(
+                    login_id,
+                    secure_captcha="early-private-proof",
+                    yd_device_token="browser-device-token",
+                )
+        request.assert_not_called()
+        self.assertNotIn("early-private-proof", str(context.exception))
+
+    def test_security_proof_confirmation_persists_session_and_cleans_attempt(self):
+        store = self.configure_storage()
+        login_id = "synthetic-proof-confirm-id"
+        self.add_qr_attempt(login_id, status="verification_required")
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=(
+                {"code": 803, "cookie": "__csrf=proof-csrf"},
+                ["MUSIC_U=proof-session; Path=/; HttpOnly"],
+            ),
+        ), mock.patch.object(
+            self.module,
+            "verify_netease_session",
+            return_value={"authenticated": True, "user_id": 7, "cached": False},
+        ):
+            raw = json.dumps(
+                self.module._check_netease_qr_login(
+                    login_id,
+                    secure_captcha="browser-validate",
+                    yd_device_token="browser-device-token",
+                )
+            )
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+        self.assertIn("MUSIC_U=proof-session", store.load_netease_session()["cookie"])
+        self.assertNotIn("proof-session", raw)
+        self.assertNotIn("browser-validate", raw)
+        self.assertNotIn("browser-device-token", raw)
+
+    def test_8830_stops_and_cleans_up_attempt(self):
+        self.configure_storage()
+        login_id = "synthetic-risk-status-id"
+        self.add_qr_attempt(login_id, status="verification_required")
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 8830, "message": "more verification"}, []),
+        ):
+            result = self.module._check_netease_qr_login(
+                login_id,
+                secure_captcha="browser-validate",
+                yd_device_token="browser-device-token",
+            )
+        self.assertEqual(
+            result["status"], "additional_security_verification_required"
+        )
+        self.assertEqual(result["upstream_code"], 8830)
         self.assertTrue(result["polling_stopped"])
         self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+
+    def test_explicit_qr_cancel_cleans_ephemeral_context(self):
+        login_id = "synthetic-explicit-cancel-id"
+        attempt = self.add_qr_attempt(
+            login_id,
+            status="verification_required",
+            last_secure_captcha_digest="synthetic-digest",
+        )
+        result = self.module._cancel_netease_qr_login(login_id)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+        self.assertEqual(attempt["temporary_cookie"], "")
+        self.assertEqual(attempt["last_secure_captcha_digest"], "")
 
     def test_unknown_qr_status_preserves_sanitized_code_and_message(self):
         self.configure_storage()
@@ -2749,6 +2908,128 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn("browser-synthetic-key", body)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+
+    def test_browser_login_page_uses_official_challenge_and_device_sdks(self):
+        login_id = "browser-sdk-contract-token-1234"
+        self.add_browser_login_attempt(login_id)
+        with urllib.request.urlopen(
+            self.base + "/netease/login/" + login_id, timeout=2
+        ) as response:
+            body = response.read().decode()
+            csp = response.headers["Content-Security-Policy"]
+        self.assertIn("https://cstaticdun.126.net/load.min.js", body)
+        self.assertIn(
+            "https://st.music.163.com/device/signature/create/deviceid.js", body
+        )
+        self.assertIn(self.module.NETEASE_YIDUN_CAPTCHA_ID, body)
+        self.assertIn(self.module.NETEASE_DEVICE_APP_ID, body)
+        self.assertIn("window.initNECaptcha", body)
+        self.assertIn("window.createNEFingerprint", body)
+        self.assertIn("result.token", body)
+        self.assertIn("data.validate", body)
+        self.assertIn("secure_captcha", body)
+        self.assertIn("yd_device_token", body)
+        self.assertIn("captcha_init_timeout", body)
+        self.assertIn("sdk_load_failed", body)
+        self.assertIn("onClose", body)
+        self.assertIn("onError", body)
+        self.assertIn("current!==flowId", body)
+        self.assertIn("destroyCaptcha()", body)
+        self.assertIn("https://cstaticdun.126.net", csp)
+        self.assertIn("https://st.music.163.com", csp)
+        self.assertIn("https://acstatic-dun.126.net", csp)
+        self.assertIn("https://cstaticdun1.126.net", csp)
+        self.assertIn("https://necaptcha.nosdn.127.net", csp)
+        self.assertIn("https://necaptcha1.nosdn.127.net", csp)
+        self.assertIn("https://nos.netease.com", csp)
+        self.assertIn("https://c.dun.163.com", csp)
+        self.assertNotIn(" *", csp)
+
+    def test_browser_login_script_has_valid_javascript_syntax(self):
+        if shutil.which("node") is None:
+            self.skipTest("Node.js is not available for JavaScript syntax validation")
+        login_id = "browser-js-syntax-token-123456"
+        self.add_browser_login_attempt(login_id)
+        page = self.module._qr_login_page(login_id)
+        script = page.rsplit("<script>", 1)[1].split("</script>", 1)[0]
+        result = subprocess.run(
+            ["node", "--check", "-"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_browser_verification_post_uses_shared_check_and_never_echoes_proof(self):
+        login_id = "browser-proof-post-token-12345"
+        self.add_browser_login_attempt(login_id)
+        shared_result = {
+            "login_id": login_id,
+            "status": "scanned",
+            "retry_after_seconds": 2,
+        }
+        proof = "browser-private-validate"
+        device_token = "browser-private-device-token"
+        request = urllib.request.Request(
+            self.base + f"/netease/login/{login_id}/status",
+            data=json.dumps(
+                {
+                    "secure_captcha": proof,
+                    "yd_device_token": device_token,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(
+            self.module, "_check_netease_qr_login", return_value=shared_result
+        ) as shared:
+            with self.assertLogs(self.module.LOG, level="INFO") as logs:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    raw = response.read().decode()
+        self.assertEqual(json.loads(raw), shared_result)
+        shared.assert_called_once_with(
+            login_id,
+            secure_captcha=proof,
+            yd_device_token=device_token,
+        )
+        self.assertNotIn(proof, raw)
+        self.assertNotIn(device_token, raw)
+        joined = "\n".join(logs.output)
+        self.assertNotIn(proof, joined)
+        self.assertNotIn(device_token, joined)
+
+    def test_browser_cancel_post_cleans_attempt(self):
+        login_id = "browser-explicit-cancel-token-12"
+        self.add_browser_login_attempt(login_id)
+        request = urllib.request.Request(
+            self.base + f"/netease/login/{login_id}/status",
+            data=b'{"cancel":true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            result = json.loads(response.read())
+        self.assertEqual(result["status"], "cancelled")
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+
+    def test_browser_status_rejects_invalid_ephemeral_proof_without_echoing_it(self):
+        login_id = "browser-invalid-proof-token-123"
+        self.add_browser_login_attempt(login_id)
+        secret = "s" * 8193
+        request = urllib.request.Request(
+            self.base + f"/netease/login/{login_id}/status",
+            data=json.dumps({"secure_captcha": secret}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=2)
+        raw = context.exception.read().decode()
+        self.assertEqual(context.exception.code, HTTPStatus.BAD_REQUEST)
+        self.assertEqual(json.loads(raw)["status"], "invalid_request")
+        self.assertNotIn(secret, raw)
 
     def test_browser_status_and_mcp_use_the_same_check_function(self):
         login_id = "browser-shared-state-token-1234"

@@ -234,7 +234,7 @@ create_curated_playlist 一次创建并核验
 | --- | --- |
 | `get_netease_login_status` | 使用 15 分钟验证缓存检查当前 session；只返回状态、来源和时间，不返回 Cookie、CSRF 或 token。 |
 | `start_netease_qr_login` | 获取 web QR key，并返回推荐的短期 HTTPS `login_url`；MCP 结果仍保留网易云 `qr_url` 和 PNG image content 作为 fallback。要求配置持久 SQLite。 |
-| `check_netease_qr_login` | 返回 `waiting`、`scanned`、`confirmed`、`expired`、`security_verification_required` 或安全的 `upstream_unknown`；确认后自动提取并持久化 session。服务端限制最短检查间隔。 |
+| `check_netease_qr_login` | 返回 `waiting`、`scanned`、`verification_required`、`confirmed`、`expired`、`additional_security_verification_required` 或安全的 `upstream_unknown`；确认后自动提取并持久化 session。服务端限制最短检查间隔。 |
 | `logout_netease` | 清空持久 runtime session 并记录 logged-out 状态，避免旧环境变量在同一数据库上立即恢复登录。 |
 
 ### 写入工具
@@ -385,12 +385,15 @@ get_recent_podcast_plays
 1. 部署时挂载持久卷，并令 `MCP_STORAGE_PATH` 指向卷内 SQLite 文件。
 2. 首次连接后调用 `start_netease_qr_login`。
 3. 优先打开返回的短期 HTTPS `login_url`。页面直接显示二维码，并约每 2.5 秒更新一次
-   `waiting` → `scanned` → `confirmed`；成功后可关闭页面。页面与 MCP 工具共用同一登录
-   attempt，不会取得最终网易云 Cookie。
+   `waiting` → `scanned` → `confirmed`；成功后可关闭页面。若网易云返回 `8821`，页面会暂停
+   普通轮询并显示“开始安全验证”，由用户完成网易官方交互式验证后继续同一个二维码 attempt，
+   不需要返回 ChatGPT 或重新扫码。页面与 MCP 工具共用同一登录 attempt，不会取得最终
+   网易云 Cookie。
 4. 如果客户端无法打开网页，MCP 结果仍包含 `login_id`、网易云 `qr_payload` / `qr_url` 和
    PNG image content，可扫码后调用 `check_netease_qr_login(login_id=...)`。
-   `expired` 表示二维码过期；`security_verification_required` 表示网易云要求额外安全验证，
-   当前 attempt 会停止且不会自动绕过；未知上游 code 会以脱敏的 `upstream_unknown` 返回。
+   `expired` 表示二维码过期；`verification_required` 表示需要在原 `login_url` 完成官方验证；
+   `additional_security_verification_required`（上游 `8830`）表示当前二维码无法继续，页面会停止。
+   未知上游 code 会以脱敏的 `upstream_unknown` 返回。
 5. 后续音乐工具自动使用新 session；Cookie 失效时会返回机器可理解的
    `NETEASE_AUTH_EXPIRED`，提示重新运行二维码流程。
 
@@ -414,7 +417,8 @@ get_recent_podcast_plays
 - session 仍有效时返回 `NETEASE_REQUEST_REJECTED`；其他 HTTP/API 故障保持普通上游错误；
 - 写入前使用 15 分钟验证缓存，避免每次操作额外调用登录接口；
 - QR 状态只在调用 `check_netease_qr_login` 或打开临时登录页时查询；网页约每 2.5 秒查询一次，
-  服务端统一执行最短 2 秒节流，不运行独立后台高频轮询。
+  服务端统一执行最短 2 秒节流，不运行独立后台高频轮询；进入官方安全验证时普通轮询暂停，
+  验证完成后只提交一次当前 proof，再按上游状态决定是否恢复轮询。
 
 ## 产品与可靠性设计
 

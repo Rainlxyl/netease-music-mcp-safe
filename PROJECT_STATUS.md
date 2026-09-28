@@ -3,6 +3,27 @@
 最后更新：2026-09-28
 状态维护者：项目协作者
 
+## 2026-09-28 8821 官方安全验证承接 checkpoint
+
+- 真实 Zeabur 验收已把剩余问题收窄为 QR check 返回 `8821`；本轮只在本地使用公开协议资料与
+  mock/synthetic 数据实现承接，没有使用真实网易云账号、commit、push 或 deploy。
+- `8821` 现在转为 `verification_required`：同一个 10 分钟内存 attempt 保留 key、`chainId`、
+  临时 Cookie、User-Agent 与 QR context，普通轮询暂停。原 `/netease/login/<token>` 页面通过
+  网易官方易盾 SDK 让用户手动完成 challenge，取得 callback 的 `data.validate` 后作为单次
+  `secureCaptcha`，并用网易官方设备脚本每次新取 `ydDeviceToken`，再恢复共享的后端检查函数。
+- proof 与 device token 只存在于浏览器和当前请求；服务端仅在 attempt 内保存 proof 的 SHA-256
+  防重复摘要，不把原值写入日志、MCP、SQLite 或异常响应。成功、800、8830、显式取消及 TTL
+  到期会清理 attempt；关闭、加载失败或初始化超时允许在 TTL 内重新打开官方 challenge。
+- `8830` 明确返回 `additional_security_verification_required` 并停止当前 attempt；未知状态继续
+  返回脱敏 `upstream_unknown`。原 Session Manager、SQLite schema、OAuth scope、环境变量
+  fallback、15 分钟验证缓存和音乐工具未重设计。
+- 登录页只放行网易官方 challenge/device 所需 origin，未新增依赖、环境变量、数据库表或
+  migration。captcha ID 与 device app ID 来自两个当前公开维护实现，已在 `DEC-009` 记录其
+  上游可变性。
+- 本地完整测试当前 123/123 通过；`scripts/check_dev_environment.ps1`、Python compile、
+  `pip check` 与 `git diff --check` 均通过。生成的 inline JavaScript 也使用本机 Node 做语法检查。
+  这些结果不等于新的 Zeabur / 真实账号验收；下一步仍需部署后人工完成一次官方 challenge。
+
 ## 2026-09-28 web QR 协议兼容与浏览器登录 checkpoint
 
 - 第一次真实 Zeabur 验收证明 OAuth、SQLite、QR key、PNG 与扫码入口可用，但确认后的未知 QR

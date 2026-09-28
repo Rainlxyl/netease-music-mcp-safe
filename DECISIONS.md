@@ -13,7 +13,8 @@
 | DEC-005 | 2026-08-07 | active | 写入采用单次调用、服务端审计与显式幂等 | 无 |
 | DEC-006 | 2026-08-07 | active | UTC 规范存储，IANA 时区仅派生展示语义 | 无 |
 | DEC-007 | 2026-09-28 | active | 网易云登录态由持久 session 优先、环境变量回退统一管理 | 无 |
-| DEC-008 | 2026-09-28 | active | web QR context 与短期网页登录共用单次内存 attempt | 无 |
+| DEC-008 | 2026-09-28 | superseded | web QR context 与短期网页登录共用单次内存 attempt | DEC-009 |
+| DEC-009 | 2026-09-28 | active | 8821 由原网页登录页承接网易官方交互验证 | 无 |
 
 ## 决策记录
 
@@ -122,7 +123,7 @@
 ### DEC-008：web QR context 与短期网页登录共用单次内存 attempt
 
 - 日期：2026-09-28
-- 状态：active
+- 状态：superseded
 - 决策：网易云二维码登录使用 web flow，并把 `chainId`、临时 web Cookie、浏览器标识、QR
   key 与检查时间保存在同一个有 10 分钟 TTL 的内存 attempt 中。MCP 与
   `/netease/login/<token>` 网页调用同一检查函数；URL token 由高熵随机值生成，成功、过期或
@@ -140,4 +141,34 @@
   SQLite migration。没有配置 public URL 时仍保留 MCP QR payload / PNG fallback。
 - 重新考虑条件：网易云再次改变 web QR 协议，或部署模型变为多实例（内存 attempt 需要共享）。
 - 替代：无
+- 被替代：DEC-009
+
+### DEC-009：8821 由原网页登录页承接网易官方交互验证
+
+- 日期：2026-09-28
+- 状态：active
+- 决策：继续使用 DEC-008 的单次 web QR attempt、短期 capability URL 与共享后端检查函数，
+  但 `8821` 不再使 attempt 失效。页面暂停普通轮询，通过网易官方 `initNECaptcha` 让用户手动
+  完成交互验证，并把 callback 的 `data.validate` 作为单次 `secureCaptcha`；每次请求通过网易
+  官方 `createNEFingerprint` 新取 `ydDeviceToken`，再用相同 key、`chainId`、临时 Cookie 与
+  User-Agent 恢复检查。`8830` 是当前 flow 不可继续的显式终态。
+- 背景：真实 Zeabur 验收证明 DEC-008 的 web QR、网页登录与 `8821` 识别均正确，但把 `8821`
+  当终态会阻断所有被网易要求安全验证的账号，无法到达 `803` 和 session 持久化。
+- 理由：MaigoLabs/amaoke.app 与 LampTales/cloudmusic2ktv 的公开实现均使用 captcha ID
+  `73a18dc827b24b18ad0783701a75277d` 和网易易盾 loader；后者还使用网易设备脚本、app ID
+  `9d0ef7e0905d422cba1ecf7e73d77e67`，并在每次 poll 获取新 token。这些常量属于网易当前 web
+  登录协议，可能随上游变化，若官方页面或多个维护实现变化必须重新核对，不能自行生成替代值。
+- 安全边界：只允许真实浏览器执行网易官方 challenge 和设备脚本；不破解、伪造或重放验证。
+  `secureCaptcha`、`ydDeviceToken` 和其值不进日志、MCP、SQLite 或异常文本，只在当前请求与
+  10 分钟内存 attempt 的防重放摘要中短暂存在。网页登录页 CSP 只放行所需网易域名。
+- 证据：`server.py`、`tests/test_server.py`、`README.md` 与 `SECURITY.md` 当前工作区实现；协议
+  参考固定版本的 MaigoLabs/amaoke.app 和 LampTales/cloudmusic2ktv。测试只使用 synthetic/mock
+  数据，本轮没有再次调用真实网易账号。
+- 影响：未新增依赖、环境变量、数据库表或 migration。官方 SDK 不可用、用户关闭 challenge
+  或初始化超时时，attempt 保留到用户重试、明确取消或 TTL 到期；成功、800、8830 与明确取消
+  会清理 attempt。
+- 重新考虑条件：网易改变 captcha ID、device app ID、SDK origin、challenge callback 或 QR
+  risk code；部署模型变为多实例时还需解决 attempt 共享，但不属于本决策范围。
+- 替代：DEC-008 中“安全验证状态后立即失效、8821 只报告不承接”的部分；其余 web QR attempt
+  与短期 URL 边界继续保留。
 - 被替代：无
