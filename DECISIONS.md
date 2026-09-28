@@ -160,13 +160,18 @@
   登录协议，可能随上游变化，若官方页面或多个维护实现变化必须重新核对，不能自行生成替代值。
 - 安全边界：只允许真实浏览器执行网易官方 challenge 和设备脚本；不破解、伪造或重放验证。
   `secureCaptcha`、`ydDeviceToken` 和其值不进日志、MCP、SQLite 或异常文本，只在当前请求与
-  10 分钟内存 attempt 的防重放摘要中短暂存在。网页登录页 CSP 只放行所需网易域名。
-- 证据：`server.py`、`tests/test_server.py`、`README.md` 与 `SECURITY.md` 当前工作区实现；协议
-  参考固定版本的 MaigoLabs/amaoke.app 和 LampTales/cloudmusic2ktv。测试只使用 synthetic/mock
-  数据，本轮没有再次调用真实网易账号。
+  10 分钟内存 attempt 的防重放摘要中短暂存在。为兼容当前网易易盾 SDK，NetEase 登录页 CSP
+  只在短期高熵 capability 页面中放行所需网易 origin，并局部允许 `'unsafe-eval'`；OAuth 页面
+  与其它 MCP HTTP surface 仍不允许 `'unsafe-eval'`。若官方 SDK 不再使用动态 Function，应移除
+  这一局部例外。
+- 证据：`server.py`、`tests/test_server.py`、`README.md` 与 `SECURITY.md` 的实现；协议参考固定
+  版本的 MaigoLabs/amaoke.app 和 LampTales/cloudmusic2ktv。2026-09-28 真实 Zeabur 与真实网易云
+  账号验收中，官方 challenge 在真实浏览器完成，随后使用同一 attempt 恢复并到达 `803`；
+  `get_netease_login_status` 返回 `authenticated: true` / `source: qr_login`，且普通读取工具
+  `list_my_playlists` 调用成功，证明 SQLite persistent session 可用于正常网易云 API。
 - 影响：未新增依赖、环境变量、数据库表或 migration。官方 SDK 不可用、用户关闭 challenge
   或初始化超时时，attempt 保留到用户重试、明确取消或 TTL 到期；成功、800、8830 与明确取消
-  会清理 attempt。
+  会清理 attempt。当前部署仍假定单副本；多实例需要共享 attempt 状态后才能保持同等流程。
 - 重新考虑条件：网易改变 captcha ID、device app ID、SDK origin、challenge callback 或 QR
   risk code；部署模型变为多实例时还需解决 attempt 共享，但不属于本决策范围。
 - 替代：DEC-008 中“安全验证状态后立即失效、8821 只报告不承接”的部分；其余 web QR attempt

@@ -3,6 +3,22 @@
 最后更新：2026-09-28
 状态维护者：项目协作者
 
+## 2026-09-28 网易云 QR 登录最终线上验收 checkpoint
+
+- 真实 Zeabur 部署与真实网易云账号端到端验收已通过：`start_netease_qr_login` 返回短期
+  `login_url`，浏览器扫码后经历 `8821`，由网易官方易盾 challenge 取得 `secureCaptcha`，再用
+  同一个 QR attempt、key、`chainId` 与临时 Cookie context 恢复检查，最终到达 `803` 并把
+  登录 session 持久化到 SQLite。
+- `get_netease_login_status` 在线实测返回 `authenticated: true`、`source: qr_login`、
+  `storage_configured: true` 与 `verification_cached: true`；随后 `list_my_playlists` 真实调用成功，
+  证明持久 session 不只是状态标记，而是可用于正常网易云读取 API。
+- 正常情况下用户不再需要人工维护 `MUSIC_U` 或 `__csrf`；session 失效后可重新通过浏览器 QR
+  登录完成更新。环境变量 Cookie 仍作为兼容 fallback 保留。
+- 当前部署继续假定单副本，因为短期 QR attempt 保存在进程内存。captcha ID、device app ID、
+  易盾 SDK origin 与登录页相关 CSP 仍是可能随网易上游变化的协议面，变化时需要重新核对。
+- 当前本地自动化基线为 124/124 通过。上述真实验收是 2026-09-28 的线上行为证据，不代表
+  网易未公开接口或外部 SDK 的持续 SLA。
+
 ## 2026-09-28 8821 官方安全验证承接 checkpoint
 
 - 真实 Zeabur 验收已把剩余问题收窄为 QR check 返回 `8821`；本轮只在本地使用公开协议资料与
@@ -22,7 +38,8 @@
   上游可变性。
 - 本地完整测试当前 123/123 通过；`scripts/check_dev_environment.ps1`、Python compile、
   `pip check` 与 `git diff --check` 均通过。生成的 inline JavaScript 也使用本机 Node 做语法检查。
-  这些结果不等于新的 Zeabur / 真实账号验收；下一步仍需部署后人工完成一次官方 challenge。
+  在该实现阶段，这些结果尚不等于 Zeabur / 真实账号验收；顶部的后续 checkpoint 已记录最终
+  线上官方 challenge、session 持久化与普通读取工具验收完成。
 
 ## 2026-09-28 web QR 协议兼容与浏览器登录 checkpoint
 
