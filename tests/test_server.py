@@ -2943,7 +2943,22 @@ class HTTPTests(unittest.TestCase):
         self.assertIn("https://necaptcha1.nosdn.127.net", csp)
         self.assertIn("https://nos.netease.com", csp)
         self.assertIn("https://c.dun.163.com", csp)
-        self.assertNotIn(" *", csp)
+        directives = {
+            parts[0]: parts[1:]
+            for directive in csp.split(";")
+            if (parts := directive.strip().split())
+        }
+        self.assertIn("https://c.dun.163.com", directives["script-src"])
+        self.assertIn("https://c.dun.163yun.com", directives["script-src"])
+        self.assertIn("https://*.nstool.netease.com", directives["script-src"])
+        self.assertIn("https://fp-upload.dun.163.com", directives["connect-src"])
+        all_sources = {
+            source for sources in directives.values() for source in sources
+        }
+        self.assertNotIn("*", all_sources)
+        self.assertNotIn("https:", all_sources)
+        self.assertNotIn("https://*.163.com", all_sources)
+        self.assertNotIn("https://*.netease.com", all_sources)
 
     def test_browser_login_script_has_valid_javascript_syntax(self):
         if shutil.which("node") is None:
@@ -3228,8 +3243,15 @@ class OAuthHTTPTests(unittest.TestCase):
         with mock.patch.object(self.module, "OAUTH_SCOPE", "netease.read netease.write"):
             with urllib.request.urlopen(self.base + "/authorize?" + query, timeout=2) as response:
                 page = response.read().decode()
+                authorization_csp = response.headers["Content-Security-Policy"]
         self.assertIn("Writes execute as a single audited call", page)
         self.assertNotIn("matching preview", page.lower())
+        self.assertEqual(
+            authorization_csp,
+            "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
+            "base-uri 'none'; frame-ancestors 'none'",
+        )
 
     def test_authorization_code_pkce_and_refresh_flow(self):
         client = self.register()
