@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
+from http import HTTPStatus
 from unittest import mock
 
 from PIL import Image
@@ -934,6 +935,28 @@ class NetEaseSessionTests(unittest.TestCase):
         self.module.SESSION_MANAGER = None
         return self.module._store()
 
+    def add_qr_attempt(self, login_id, *, created_monotonic=None, **overrides):
+        context = self.module.create_web_qr_context(now_ms=1_700_000_000_000)
+        attempt = {
+            "key": "synthetic-key",
+            **context,
+            "qr_payload": (
+                "https://music.163.com/st/platform/scanlogin?"
+                "codekey=synthetic-key&chainId=synthetic-chain"
+            ),
+            "status": "waiting",
+            "created_monotonic": (
+                self.module.time.monotonic()
+                if created_monotonic is None
+                else created_monotonic
+            ),
+            "last_checked_monotonic": 0.0,
+            "checking": False,
+            **overrides,
+        }
+        self.module.QR_LOGIN_ATTEMPTS[login_id] = attempt
+        return attempt
+
     def test_environment_cookie_remains_a_supported_fallback(self):
         manager = self.module._session_manager()
         session = manager.current()
@@ -1022,12 +1045,7 @@ class NetEaseSessionTests(unittest.TestCase):
         cases = {801: "waiting", 802: "scanned", 800: "expired"}
         for index, (code, expected) in enumerate(cases.items(), 1):
             login_id = f"synthetic-login-id-{index:02d}"
-            self.module.QR_LOGIN_ATTEMPTS[login_id] = {
-                "key": f"synthetic-key-{index}",
-                "status": "waiting",
-                "created_monotonic": self.module.time.monotonic(),
-                "last_checked_monotonic": 0.0,
-            }
+            self.add_qr_attempt(login_id, key=f"synthetic-key-{index}")
             with mock.patch.object(
                 self.module,
                 "_netease_qr_request",
@@ -1038,21 +1056,42 @@ class NetEaseSessionTests(unittest.TestCase):
 
     def test_start_qr_login_returns_only_safe_rendering_data(self):
         self.configure_storage()
+        self.module.PUBLIC_URL = "https://music.example.test"
         with mock.patch.object(
             self.module,
             "_netease_qr_request",
-            return_value=({"code": 200, "unikey": "synthetic-qr-key"}, []),
-        ):
+            return_value=(
+                {"code": 200, "unikey": "synthetic-qr-key"},
+                ["NMTID=temporary-secret; Path=/"],
+            ),
+        ) as request:
             raw_result = self.module.start_netease_qr_login()
         result = json.loads(raw_result)
         self.assertEqual(result["status"], "waiting")
-        self.assertIn("codekey=synthetic-qr-key", result["qr_payload"])
+        parsed = urllib.parse.urlsplit(result["qr_payload"])
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(parsed.path, "/st/platform/scanlogin")
+        self.assertEqual(query["codekey"], ["synthetic-qr-key"])
+        self.assertEqual(query["hdw_device"], ["web"])
+        self.assertEqual(query["hdw_appid"], ["web"])
+        self.assertEqual(query["hitExp"], ["1"])
+        self.assertTrue(query["chainId"][0].startswith("v1_unknown-"))
         self.assertIn("login_id", result)
+        self.assertEqual(
+            result["login_url"],
+            f"https://music.example.test/netease/login/{result['login_id']}",
+        )
+        self.assertEqual(request.call_args.args[1], {"type": 1, "noCheckToken": True})
+        attempt = self.module.QR_LOGIN_ATTEMPTS[result["login_id"]]
+        self.assertEqual(attempt["chain_id"], query["chainId"][0])
+        self.assertIn("NMTID=temporary-secret", attempt["temporary_cookie"])
         self.assertNotIn("MUSIC_U", raw_result)
         self.assertNotIn("__csrf", raw_result)
+        self.assertNotIn("temporary-secret", raw_result)
 
     def test_start_qr_login_mcp_result_contains_text_url_and_png(self):
         self.configure_storage()
+        self.module.PUBLIC_URL = "https://music.example.test"
         with mock.patch.object(
             self.module,
             "_netease_qr_request",
@@ -1073,6 +1112,7 @@ class NetEaseSessionTests(unittest.TestCase):
         self.assertEqual([item["type"] for item in content], ["text", "image"])
         text_result = json.loads(content[0]["text"])
         self.assertEqual(text_result["qr_url"], text_result["qr_payload"])
+        self.assertTrue(text_result["login_url"].startswith("https://music.example.test/"))
         self.assertTrue(text_result["qr_url"].startswith("https://music.163.com/"))
         self.assertEqual(content[1]["mimeType"], "image/png")
         image_data = base64.b64decode(content[1]["data"], validate=True)
@@ -1092,20 +1132,18 @@ class NetEaseSessionTests(unittest.TestCase):
     def test_confirmed_qr_login_persists_session_without_returning_it(self):
         store = self.configure_storage()
         login_id = "synthetic-confirmed-login-id"
-        self.module.QR_LOGIN_ATTEMPTS[login_id] = {
-            "key": "synthetic-key",
-            "status": "waiting",
-            "created_monotonic": self.module.time.monotonic(),
-            "last_checked_monotonic": 0.0,
-        }
+        self.add_qr_attempt(
+            login_id,
+            temporary_cookie="NMTID=temp-only; MUSIC_U=temporary-old; __csrf=old-csrf",
+        )
         headers = [
             "MUSIC_U=qr-secret; Path=/; HttpOnly",
-            "__csrf=qr-csrf; Path=/; Secure",
+            "__csrf=header-csrf; Path=/; Secure",
         ]
         with mock.patch.object(
             self.module,
             "_netease_qr_request",
-            return_value=({"code": 803}, headers),
+            return_value=({"code": 803, "cookie": "__csrf=body-csrf"}, headers),
         ), mock.patch.object(
             self.module,
             "verify_netease_session",
@@ -1117,9 +1155,143 @@ class NetEaseSessionTests(unittest.TestCase):
         self.assertTrue(result["session_persisted"])
         persisted = store.load_netease_session()
         self.assertIn("MUSIC_U=qr-secret", persisted["cookie"])
-        self.assertEqual(persisted["csrf"], "qr-csrf")
+        self.assertEqual(persisted["csrf"], "body-csrf")
+        self.assertNotIn("NMTID", persisted["cookie"])
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
         self.assertNotIn("qr-secret", raw_result)
-        self.assertNotIn("qr-csrf", raw_result)
+        self.assertNotIn("body-csrf", raw_result)
+
+    def test_web_qr_check_reuses_chain_cookie_and_type(self):
+        self.configure_storage()
+        self.module.PUBLIC_URL = "https://music.example.test"
+        responses = [
+            (
+                {"code": 200, "unikey": "continuity-key"},
+                ["NMTID=server-temporary; Path=/"],
+            ),
+            ({"code": 801}, ["WEVNSM=2.0.0; Path=/"]),
+        ]
+        with mock.patch.object(
+            self.module, "_netease_qr_request", side_effect=responses
+        ) as request:
+            started = json.loads(self.module.start_netease_qr_login())
+            login_id = started["login_id"]
+            before = dict(self.module.QR_LOGIN_ATTEMPTS[login_id])
+            checked = json.loads(self.module.check_netease_qr_login(login_id))
+        self.assertEqual(checked["status"], "waiting")
+        key_call, check_call = request.call_args_list
+        self.assertEqual(key_call.args[1], {"type": 1, "noCheckToken": True})
+        self.assertEqual(check_call.args[1]["type"], 1)
+        self.assertTrue(check_call.args[1]["noCheckToken"])
+        self.assertEqual(check_call.args[1]["ydDeviceToken"], "")
+        self.assertTrue(check_call.kwargs["checking"])
+        self.assertEqual(
+            check_call.args[2]["chain_id"], before["chain_id"]
+        )
+        self.assertIn("NMTID=server-temporary", check_call.args[2]["temporary_cookie"])
+        after = self.module.QR_LOGIN_ATTEMPTS[login_id]
+        self.assertEqual(after["chain_id"], before["chain_id"])
+        self.assertIn("WEVNSM=2.0.0", after["temporary_cookie"])
+
+    def test_web_qr_request_uses_browser_headers_and_chain(self):
+        class Headers:
+            def get_all(self, _name):
+                return []
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"code":801}'
+
+        context = self.module.create_web_qr_context(now_ms=1_700_000_000_000)
+        with mock.patch.object(
+            self.module,
+            "weapi_encrypt",
+            return_value={"params": "safe", "encSecKey": "safe"},
+        ) as encrypt, mock.patch.object(
+            self.module.urllib.request, "urlopen", return_value=Response()
+        ) as urlopen:
+            response, _ = self.module._netease_qr_request(
+                "/api/login/qrcode/client/login",
+                {"key": "synthetic", "type": 1, "noCheckToken": True},
+                context,
+                checking=True,
+            )
+        self.assertEqual(response["code"], 801)
+        payload = json.loads(encrypt.call_args.args[0])
+        self.assertEqual(payload["type"], 1)
+        self.assertTrue(payload["noCheckToken"])
+        request = urlopen.call_args.args[0]
+        headers = {name.casefold(): value for name, value in request.header_items()}
+        self.assertEqual(headers["origin"], "https://music.163.com")
+        self.assertEqual(headers["referer"], "https://music.163.com/")
+        self.assertEqual(headers["x-os"], "web")
+        self.assertEqual(headers["x-loginmethod"], "QrCode")
+        self.assertEqual(headers["x-login-chain-id"], context["chain_id"])
+        self.assertEqual(headers["cookie"], context["temporary_cookie"])
+
+    def test_security_verification_status_stops_and_cleans_up(self):
+        self.configure_storage()
+        login_id = "synthetic-security-login-id"
+        self.add_qr_attempt(login_id)
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 8821, "message": "security verification"}, []),
+        ):
+            result = json.loads(self.module.check_netease_qr_login(login_id))
+        self.assertEqual(result["status"], "security_verification_required")
+        self.assertEqual(result["upstream_code"], 8821)
+        self.assertTrue(result["polling_stopped"])
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+
+    def test_unknown_qr_status_preserves_sanitized_code_and_message(self):
+        self.configure_storage()
+        login_id = "synthetic-unknown-login-id"
+        self.add_qr_attempt(login_id)
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=(
+                {
+                    "code": 8999,
+                    "message": (
+                        "changed; MUSIC_U=not-for-clients; "
+                        "WNMCID=internal-device-value"
+                    ),
+                },
+                [],
+            ),
+        ):
+            raw = self.module.check_netease_qr_login(login_id)
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "upstream_unknown")
+        self.assertEqual(result["upstream_code"], 8999)
+        self.assertTrue(result["polling_stopped"])
+        self.assertNotIn("not-for-clients", raw)
+        self.assertNotIn("internal-device-value", raw)
+
+    def test_expired_attempt_cleanup_removes_ephemeral_context(self):
+        login_id = "synthetic-expired-login-id"
+        attempt = self.add_qr_attempt(
+            login_id,
+            created_monotonic=self.module.time.monotonic()
+            - self.module.QR_LOGIN_TTL_SECONDS
+            - 1,
+        )
+        secret_cookie = attempt["temporary_cookie"]
+        with self.module.QR_LOGIN_LOCK:
+            self.module._cleanup_qr_attempts(self.module.time.monotonic())
+        self.assertNotIn(login_id, self.module.QR_LOGIN_ATTEMPTS)
+        self.assertEqual(attempt["temporary_cookie"], "")
+        self.assertNotEqual(secret_cookie, "")
 
     def test_logout_clears_runtime_cookie_and_does_not_expose_secrets(self):
         store = self.configure_storage()
@@ -2538,6 +2710,21 @@ class HTTPTests(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=2)
 
+    def add_browser_login_attempt(self, login_id):
+        context = self.module.create_web_qr_context(now_ms=1_700_000_000_000)
+        self.module.QR_LOGIN_ATTEMPTS[login_id] = {
+            "key": "browser-synthetic-key",
+            **context,
+            "qr_payload": (
+                "https://music.163.com/st/platform/scanlogin?"
+                "codekey=browser-synthetic-key&chainId=browser-chain"
+            ),
+            "status": "waiting",
+            "created_monotonic": self.module.time.monotonic(),
+            "last_checked_monotonic": 0.0,
+            "checking": False,
+        }
+
     def test_health_does_not_expose_secrets(self):
         with urllib.request.urlopen(self.base + "/health", timeout=2) as response:
             body = response.read().decode()
@@ -2545,6 +2732,74 @@ class HTTPTests(unittest.TestCase):
         self.assertIn('"status": "ok"', body)
         self.assertIn('"timezone": "Asia/Shanghai"', body)
         self.assertNotIn("MUSIC_U", body)
+
+    def test_browser_login_page_is_capability_scoped_and_hides_cookies(self):
+        login_id = "browser-login-token-1234567890"
+        self.add_browser_login_attempt(login_id)
+        attempt = self.module.QR_LOGIN_ATTEMPTS[login_id]
+        attempt["temporary_cookie"] += "; MUSIC_U=browser-hidden; __csrf=hidden-csrf"
+        with urllib.request.urlopen(
+            self.base + "/netease/login/" + login_id, timeout=2
+        ) as response:
+            body = response.read().decode()
+        self.assertIn("data:image/png;base64,", body)
+        self.assertIn("等待扫码", body)
+        self.assertNotIn("browser-hidden", body)
+        self.assertNotIn("hidden-csrf", body)
+        self.assertNotIn("browser-synthetic-key", body)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+
+    def test_browser_status_and_mcp_use_the_same_check_function(self):
+        login_id = "browser-shared-state-token-1234"
+        self.add_browser_login_attempt(login_id)
+        shared_result = {
+            "login_id": login_id,
+            "status": "scanned",
+            "retry_after_seconds": 2,
+        }
+        with mock.patch.object(
+            self.module, "_check_netease_qr_login", return_value=shared_result
+        ) as shared:
+            with urllib.request.urlopen(
+                self.base + f"/netease/login/{login_id}/status", timeout=2
+            ) as response:
+                browser_result = json.loads(response.read())
+            mcp_result = json.loads(self.module.check_netease_qr_login(login_id))
+        self.assertEqual(browser_result, shared_result)
+        self.assertEqual(mcp_result, shared_result)
+        self.assertEqual(shared.call_args_list, [mock.call(login_id), mock.call(login_id)])
+
+    def test_invalid_or_expired_browser_login_token_is_rejected(self):
+        cases = {
+            "browser-invalid-token-12345678": False,
+            "browser-expired-token-1234567": True,
+        }
+        for login_id, create_expired in cases.items():
+            if create_expired:
+                self.add_browser_login_attempt(login_id)
+                self.module.QR_LOGIN_ATTEMPTS[login_id]["created_monotonic"] -= (
+                    self.module.QR_LOGIN_TTL_SECONDS + 1
+                )
+            with self.subTest(login_id=login_id), self.assertRaises(
+                urllib.error.HTTPError
+            ) as context:
+                urllib.request.urlopen(
+                    self.base + f"/netease/login/{login_id}/status", timeout=2
+                )
+            self.assertEqual(context.exception.code, HTTPStatus.GONE)
+
+    def test_browser_login_token_is_redacted_from_access_log(self):
+        login_id = "browser-log-secret-token-123456"
+        self.add_browser_login_attempt(login_id)
+        with self.assertLogs(self.module.LOG, level="INFO") as logs:
+            with urllib.request.urlopen(
+                self.base + "/netease/login/" + login_id, timeout=2
+            ):
+                pass
+        joined = "\n".join(logs.output)
+        self.assertNotIn(login_id, joined)
+        self.assertIn("/netease/login/[REDACTED]", joined)
 
     def test_stateless_mcp_get_returns_method_not_allowed(self):
         with self.assertRaises(urllib.error.HTTPError) as context:

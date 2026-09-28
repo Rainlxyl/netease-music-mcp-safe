@@ -82,8 +82,8 @@ flowchart TB
 ## Quick Start
 
 1. Fork 或 clone 本仓库。
-2. 挂载持久卷并设置 `MCP_STORAGE_PATH`，连接 MCP 后运行 `start_netease_qr_login`，用网易云
-   App 扫码确认，再运行 `check_netease_qr_login`。以后 session 会自动持久化。
+2. 挂载持久卷并设置 `MCP_STORAGE_PATH`，连接 MCP 后运行 `start_netease_qr_login`，打开返回的
+   临时 `login_url`，用网易云 App 扫码确认。网页会自动显示状态，成功后 session 自动持久化。
 3. 以 `.env.example` 为配置清单填写自己的环境变量。仓库中的示例只有 placeholder；真实
    `.env` 和 secrets **绝对不能 commit**。本服务不会自动加载 `.env`，请通过 shell、进程
    管理器或部署平台把变量导入进程环境。
@@ -233,8 +233,8 @@ create_curated_playlist 一次创建并核验
 | 工具 | 当前接口与语义 |
 | --- | --- |
 | `get_netease_login_status` | 使用 15 分钟验证缓存检查当前 session；只返回状态、来源和时间，不返回 Cookie、CSRF 或 token。 |
-| `start_netease_qr_login` | 获取二维码 key；MCP 结果同时返回文字说明、可直接打开的网易云 HTTPS `qr_url` 和 PNG 二维码 image content；要求配置持久 SQLite。 |
-| `check_netease_qr_login` | 返回 `waiting`、`scanned`、`confirmed` 或 `expired`；确认后自动提取并持久化 session。服务端限制最短检查间隔，不后台轮询。 |
+| `start_netease_qr_login` | 获取 web QR key，并返回推荐的短期 HTTPS `login_url`；MCP 结果仍保留网易云 `qr_url` 和 PNG image content 作为 fallback。要求配置持久 SQLite。 |
+| `check_netease_qr_login` | 返回 `waiting`、`scanned`、`confirmed`、`expired`、`security_verification_required` 或安全的 `upstream_unknown`；确认后自动提取并持久化 session。服务端限制最短检查间隔。 |
 | `logout_netease` | 清空持久 runtime session 并记录 logged-out 状态，避免旧环境变量在同一数据库上立即恢复登录。 |
 
 ### 写入工具
@@ -384,11 +384,13 @@ get_recent_podcast_plays
 
 1. 部署时挂载持久卷，并令 `MCP_STORAGE_PATH` 指向卷内 SQLite 文件。
 2. 首次连接后调用 `start_netease_qr_login`。
-3. MCP 结果包含文字字段（`login_id`、`qr_payload`、可直接打开的网易云 HTTPS `qr_url`）和
-   一个 PNG image content。ChatGPT 可直接向用户展示该图片，不需要假设客户端会自行把文字
-   payload 转成二维码；用户只在网易云 App 中扫码并确认。
-4. 调用 `check_netease_qr_login(login_id=...)`。`waiting` 表示等待扫码，`scanned` 表示已扫码待
-   确认，`confirmed` 表示 session 已自动持久化，`expired` 则重新开始。
+3. 优先打开返回的短期 HTTPS `login_url`。页面直接显示二维码，并约每 2.5 秒更新一次
+   `waiting` → `scanned` → `confirmed`；成功后可关闭页面。页面与 MCP 工具共用同一登录
+   attempt，不会取得最终网易云 Cookie。
+4. 如果客户端无法打开网页，MCP 结果仍包含 `login_id`、网易云 `qr_payload` / `qr_url` 和
+   PNG image content，可扫码后调用 `check_netease_qr_login(login_id=...)`。
+   `expired` 表示二维码过期；`security_verification_required` 表示网易云要求额外安全验证，
+   当前 attempt 会停止且不会自动绕过；未知上游 code 会以脱敏的 `upstream_unknown` 返回。
 5. 后续音乐工具自动使用新 session；Cookie 失效时会返回机器可理解的
    `NETEASE_AUTH_EXPIRED`，提示重新运行二维码流程。
 
@@ -411,7 +413,8 @@ get_recent_podcast_plays
 - `403 illegal request` 会先验证当前 session，只有验证确实失败才归类为 auth expired；
 - session 仍有效时返回 `NETEASE_REQUEST_REJECTED`；其他 HTTP/API 故障保持普通上游错误；
 - 写入前使用 15 分钟验证缓存，避免每次操作额外调用登录接口；
-- QR 状态只在调用 `check_netease_qr_login` 时查询，最短间隔 2 秒，不运行后台高频轮询。
+- QR 状态只在调用 `check_netease_qr_login` 或打开临时登录页时查询；网页约每 2.5 秒查询一次，
+  服务端统一执行最短 2 秒节流，不运行独立后台高频轮询。
 
 ## 产品与可靠性设计
 

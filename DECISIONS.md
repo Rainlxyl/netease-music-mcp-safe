@@ -13,6 +13,7 @@
 | DEC-005 | 2026-08-07 | active | 写入采用单次调用、服务端审计与显式幂等 | 无 |
 | DEC-006 | 2026-08-07 | active | UTC 规范存储，IANA 时区仅派生展示语义 | 无 |
 | DEC-007 | 2026-09-28 | active | 网易云登录态由持久 session 优先、环境变量回退统一管理 | 无 |
+| DEC-008 | 2026-09-28 | active | web QR context 与短期网页登录共用单次内存 attempt | 无 |
 
 ## 决策记录
 
@@ -115,5 +116,28 @@
 - 证据：`netease_session.py`、`persistence.py`、`server.py`、`tests/test_server.py`、`README.md` 与 `SECURITY.md` 的当前工作区实现。
 - 影响：二维码登录需要既有 `MCP_STORAGE_PATH` 指向持久卷；OAuth 客户端需要 `netease.session` scope；登出会写入 tombstone，阻止旧环境变量 Cookie 立即复活，直到新的二维码登录成功。
 - 重新考虑条件：部署模型变为多租户/多实例、持久卷不再具备可信访问边界，或上游二维码/验证协议发生变化。
+- 替代：无
+- 被替代：无
+
+### DEC-008：web QR context 与短期网页登录共用单次内存 attempt
+
+- 日期：2026-09-28
+- 状态：active
+- 决策：网易云二维码登录使用 web flow，并把 `chainId`、临时 web Cookie、浏览器标识、QR
+  key 与检查时间保存在同一个有 10 分钟 TTL 的内存 attempt 中。MCP 与
+  `/netease/login/<token>` 网页调用同一检查函数；URL token 由高熵随机值生成，成功、过期或
+  安全验证状态后立即失效。浏览器只接收二维码和脱敏状态，最终 session 只在服务端持久化。
+- 背景：第一次真实验收中，旧 `type=3` / `/login?codekey=` flow 可以扫码，但确认后返回第一版
+  未识别的状态且没有 session。ChatGPT 客户端也没有稳定展示 MCP image content。
+- 理由：2026 年仍在维护的 API 实现表明 web QR key/create/check 需要连续的 `type=1`、
+  `chainId`、临时 Cookie 与 web headers；短期 capability URL 可在不引入前端项目或第二套状态机
+  的前提下，提供稳定的浏览器扫码体验。
+- 安全边界：临时 web Cookie、QR key 和 chain context 不写 SQLite、不返回 MCP、不进入日志；
+  登录页 token 不允许读取已有 persistent session。`8821` 只报告需要额外安全验证，不尝试绕过。
+- 证据：`netease_session.py`、`server.py`、`tests/test_server.py` 与 README 当前工作区实现；协议
+  依据为 NeteaseCloudMusicApiEnhanced/api-enhanced 的 PR #201，但本轮没有真实账号网络测试。
+- 影响：远程部署继续使用既有 `MCP_PUBLIC_URL` 生成 HTTPS login URL；未新增环境变量、依赖或
+  SQLite migration。没有配置 public URL 时仍保留 MCP QR payload / PNG fallback。
+- 重新考虑条件：网易云再次改变 web QR 协议，或部署模型变为多实例（内存 attempt 需要共享）。
 - 替代：无
 - 被替代：无

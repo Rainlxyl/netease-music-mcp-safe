@@ -15,6 +15,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -32,6 +33,8 @@ from image_safety import normalize_cover_image, validate_file_reference
 from netease_session import (
     SessionManager,
     cookie_from_login_response,
+    create_web_qr_context,
+    merge_cookie_values,
     parse_cookie,
     qr_png,
     weapi_encrypt,
@@ -346,7 +349,7 @@ READ_TOOLS = [
     ),
     _tool(
         "start_netease_qr_login",
-        "Start NetEase App QR login. Returns a safe QR payload/URL and a login_id; never returns a cookie. Requires persistent SQLite storage.",
+        "Start NetEase App QR login. Prefer the returned short-lived browser login_url; a safe QR payload and image are also returned as fallbacks. Never returns a cookie. Requires persistent SQLite storage.",
         read_only=False,
     ),
     _tool(
@@ -840,24 +843,38 @@ def get_uid() -> int:
 
 
 def _netease_qr_request(
-    path: str, data: dict[str, Any]
+    path: str,
+    data: dict[str, Any],
+    context: dict[str, str],
+    *,
+    checking: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     payload = {**data, "csrf_token": ""}
     encrypted = weapi_encrypt(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
     url = "https://music.163.com/weapi/" + path.removeprefix("/api/").lstrip("/")
+    headers = {
+        "User-Agent": context["user_agent"],
+        "Referer": "https://music.163.com/",
+        "Origin": "https://music.163.com",
+        "Cookie": context["temporary_cookie"],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-os": "web",
+        "X-channelSource": "undefined",
+        "Nm-GCore-Status": "1",
+    }
+    if checking:
+        headers.update(
+            {
+                "X-loginMethod": "QrCode",
+                "x-login-chain-id": context["chain_id"],
+            }
+        )
     request = urllib.request.Request(
         url,
         data=urllib.parse.urlencode(encrypted).encode("ascii"),
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-            ),
-            "Referer": "https://music.163.com/",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -866,6 +883,12 @@ def _netease_qr_request(
             headers = response.headers.get_all("Set-Cookie") or []
             return result, headers
     except urllib.error.HTTPError as exc:
+        try:
+            result = _decode_netease_payload(exc.read(1_000_000))
+        except (NetEaseError, UpstreamOutcomeUnknown):
+            result = {}
+        if _response_code(result) is not None:
+            return result, exc.headers.get_all("Set-Cookie") or []
         raise NetEaseRequestRejected(
             f"NETEASE_REQUEST_REJECTED: NetEase rejected the QR login request with HTTP {exc.code}."
         ) from None
@@ -922,7 +945,33 @@ def _cleanup_qr_attempts(now: float) -> None:
     expired_before = now - QR_LOGIN_TTL_SECONDS
     for login_id, attempt in list(QR_LOGIN_ATTEMPTS.items()):
         if float(attempt.get("created_monotonic", 0)) < expired_before:
-            QR_LOGIN_ATTEMPTS.pop(login_id, None)
+            _discard_qr_attempt_locked(login_id)
+
+
+def _discard_qr_attempt_locked(login_id: str) -> None:
+    attempt = QR_LOGIN_ATTEMPTS.pop(login_id, None)
+    if attempt is not None:
+        for name in ("key", "temporary_cookie", "yd_device_token", "chain_id"):
+            attempt[name] = ""
+
+
+def _qr_context(attempt: dict[str, Any]) -> dict[str, str]:
+    return {
+        name: str(attempt.get(name) or "")
+        for name in (
+            "chain_id",
+            "temporary_cookie",
+            "user_agent",
+            "yd_device_token",
+        )
+    }
+
+
+def _safe_qr_message(response: dict[str, Any], fallback: str) -> str:
+    message = response.get("message") or response.get("msg")
+    if not isinstance(message, str) or not message.strip():
+        return fallback
+    return _redact_secrets(message.strip())
 
 
 def start_netease_qr_login() -> str:
@@ -931,8 +980,14 @@ def start_netease_qr_login() -> str:
         raise NetEaseError(
             "NETEASE_SESSION_STORAGE_REQUIRED: Set MCP_STORAGE_PATH to a SQLite file on a persistent volume before QR login."
         )
-    response, _ = _netease_qr_request(
-        "/api/login/qrcode/unikey", {"type": 3}
+    context = create_web_qr_context()
+    response, set_cookie_headers = _netease_qr_request(
+        "/api/login/qrcode/unikey",
+        {"type": 1, "noCheckToken": True},
+        context,
+    )
+    context["temporary_cookie"] = merge_cookie_values(
+        context["temporary_cookie"], set_cookie_headers
     )
     data = response.get("data") if isinstance(response.get("data"), dict) else response
     key = data.get("unikey") if isinstance(data, dict) else None
@@ -941,33 +996,51 @@ def start_netease_qr_login() -> str:
             "NETEASE_REQUEST_REJECTED: NetEase did not create a usable QR login key."
         )
     login_id = secrets.token_urlsafe(24)
-    qr_url = "https://music.163.com/login?codekey=" + urllib.parse.quote(key, safe="")
+    qr_url = "https://music.163.com/st/platform/scanlogin?" + urllib.parse.urlencode(
+        {
+            "codekey": key,
+            "chainId": context["chain_id"],
+            "hdw_device": "web",
+            "hdw_appid": "web",
+            "hitExp": "1",
+        }
+    )
+    login_url = (
+        PUBLIC_URL + "/netease/login/" + urllib.parse.quote(login_id, safe="")
+        if PUBLIC_URL
+        else None
+    )
     now = time.monotonic()
     with QR_LOGIN_LOCK:
         _cleanup_qr_attempts(now)
         QR_LOGIN_ATTEMPTS[login_id] = {
             "key": key,
+            **context,
+            "qr_payload": qr_url,
             "status": "waiting",
             "created_monotonic": now,
             "last_checked_monotonic": 0.0,
+            "checking": False,
         }
     return _json_text(
         {
             "login_id": login_id,
             "status": "waiting",
+            "login_url": login_url,
             "qr_payload": qr_url,
             "qr_url": qr_url,
             "expires_in_seconds": QR_LOGIN_TTL_SECONDS,
             "minimum_check_interval_seconds": QR_LOGIN_MIN_CHECK_SECONDS,
             "instructions": (
-                "Render qr_payload as a QR code, then scan and confirm it in the NetEase App. "
-                "After confirmation, call check_netease_qr_login with login_id."
+                "Open login_url in a browser and scan the displayed QR code with the NetEase App. "
+                "If login_url is unavailable, render qr_payload as a QR code and then call "
+                "check_netease_qr_login with login_id."
             ),
         }
     )
 
 
-def check_netease_qr_login(login_id: Any) -> str:
+def _check_netease_qr_login(login_id: Any) -> dict[str, Any]:
     if not isinstance(login_id, str) or not 16 <= len(login_id) <= 100:
         raise ValueError("login_id must be the value returned by start_netease_qr_login.")
     now = time.monotonic()
@@ -975,55 +1048,85 @@ def check_netease_qr_login(login_id: Any) -> str:
         _cleanup_qr_attempts(now)
         attempt = QR_LOGIN_ATTEMPTS.get(login_id)
         if attempt is None:
-            return _json_text(
-                {
-                    "login_id": login_id,
-                    "status": "expired",
-                    "next_tool": "start_netease_qr_login",
-                }
-            )
-        if attempt.get("status") in {"confirmed", "expired"}:
-            terminal_status = str(attempt["status"])
-            return _json_text(
-                {
-                    "login_id": login_id,
-                    "status": terminal_status,
-                    "session_persisted": terminal_status == "confirmed",
-                    "next_tool": "start_netease_qr_login"
-                    if terminal_status == "expired"
-                    else None,
-                }
-            )
+            return {
+                "login_id": login_id,
+                "status": "expired",
+                "next_tool": "start_netease_qr_login",
+            }
+        if attempt.get("checking"):
+            return {
+                "login_id": login_id,
+                "status": str(attempt.get("status") or "waiting"),
+                "throttled": True,
+                "retry_after_seconds": QR_LOGIN_MIN_CHECK_SECONDS,
+            }
         elapsed = now - float(attempt.get("last_checked_monotonic", 0))
         if attempt.get("last_checked_monotonic") and elapsed < QR_LOGIN_MIN_CHECK_SECONDS:
-            return _json_text(
-                {
-                    "login_id": login_id,
-                    "status": attempt["status"],
-                    "throttled": True,
-                    "retry_after_seconds": round(QR_LOGIN_MIN_CHECK_SECONDS - elapsed, 2),
-                }
-            )
+            return {
+                "login_id": login_id,
+                "status": attempt["status"],
+                "throttled": True,
+                "retry_after_seconds": round(QR_LOGIN_MIN_CHECK_SECONDS - elapsed, 2),
+            }
         attempt["last_checked_monotonic"] = now
+        attempt["checking"] = True
         key = str(attempt["key"])
+        context = _qr_context(attempt)
 
-    response, set_cookie_headers = _netease_qr_request(
-        "/api/login/qrcode/client/login", {"key": key, "type": 3}
-    )
+    try:
+        response, set_cookie_headers = _netease_qr_request(
+            "/api/login/qrcode/client/login",
+            {
+                "key": key,
+                "type": 1,
+                "noCheckToken": True,
+                "ydDeviceToken": context["yd_device_token"],
+            },
+            context,
+            checking=True,
+        )
+    finally:
+        with QR_LOGIN_LOCK:
+            current = QR_LOGIN_ATTEMPTS.get(login_id)
+            if current is not None:
+                current["checking"] = False
     code = _response_code(response)
-    statuses = {800: "expired", 801: "waiting", 802: "scanned", 803: "confirmed"}
+    statuses = {
+        800: "expired",
+        801: "waiting",
+        802: "scanned",
+        803: "confirmed",
+        8821: "security_verification_required",
+    }
     status = statuses.get(code)
     if status is None:
-        raise NetEaseRequestRejected(
-            "NETEASE_REQUEST_REJECTED: NetEase returned an unknown QR login status."
-        )
+        with QR_LOGIN_LOCK:
+            current = QR_LOGIN_ATTEMPTS.get(login_id)
+            if current is not None:
+                current["status"] = "upstream_unknown"
+        return {
+            "login_id": login_id,
+            "status": "upstream_unknown",
+            "upstream_code": code,
+            "message": _safe_qr_message(
+                response, "NetEase returned an unrecognized QR login status."
+            ),
+            "polling_stopped": True,
+        }
+
+    merged_temporary_cookie = merge_cookie_values(
+        context["temporary_cookie"], set_cookie_headers, response.get("cookie")
+    )
 
     if status == "confirmed":
         cookie = cookie_from_login_response(
             set_cookie_headers,
             response.get("cookie"),
+            base_cookie=context["temporary_cookie"],
         )
         if not parse_cookie(cookie).get("MUSIC_U"):
+            with QR_LOGIN_LOCK:
+                _discard_qr_attempt_locked(login_id)
             raise NetEaseRequestRejected(
                 "NETEASE_REQUEST_REJECTED: NetEase confirmed the QR login but did not return a usable session."
             )
@@ -1032,40 +1135,104 @@ def check_netease_qr_login(login_id: Any) -> str:
         try:
             verify_netease_session(force=True)
         except NetEaseAuthExpired:
+            with QR_LOGIN_LOCK:
+                _discard_qr_attempt_locked(login_id)
             raise
         except NetEaseError:
             verification_state = "pending"
         with QR_LOGIN_LOCK:
-            current = QR_LOGIN_ATTEMPTS.get(login_id)
-            if current is not None:
-                current.update({"key": "", "status": "confirmed"})
-        return _json_text(
-            {
-                "login_id": login_id,
-                "status": "confirmed",
-                "session_persisted": True,
-                "verification": verification_state,
-                "next_tool": "get_netease_login_status"
-                if verification_state == "pending"
-                else None,
-            }
-        )
+            _discard_qr_attempt_locked(login_id)
+        return {
+            "login_id": login_id,
+            "status": "confirmed",
+            "session_persisted": True,
+            "verification": verification_state,
+            "next_tool": "get_netease_login_status"
+            if verification_state == "pending"
+            else None,
+        }
+
+    if status == "security_verification_required":
+        with QR_LOGIN_LOCK:
+            _discard_qr_attempt_locked(login_id)
+        return {
+            "login_id": login_id,
+            "status": status,
+            "upstream_code": code,
+            "message": _safe_qr_message(
+                response,
+                "NetEase requires additional security verification; this login attempt cannot continue here.",
+            ),
+            "polling_stopped": True,
+            "next_tool": "start_netease_qr_login",
+        }
 
     with QR_LOGIN_LOCK:
         current = QR_LOGIN_ATTEMPTS.get(login_id)
         if current is not None:
             current["status"] = status
+            current["temporary_cookie"] = merged_temporary_cookie
             if status == "expired":
-                current["key"] = ""
-    return _json_text(
-        {
-            "login_id": login_id,
-            "status": status,
-            "retry_after_seconds": QR_LOGIN_MIN_CHECK_SECONDS
-            if status in {"waiting", "scanned"}
-            else None,
-            "next_tool": "start_netease_qr_login" if status == "expired" else None,
-        }
+                _discard_qr_attempt_locked(login_id)
+    return {
+        "login_id": login_id,
+        "status": status,
+        "retry_after_seconds": QR_LOGIN_MIN_CHECK_SECONDS
+        if status in {"waiting", "scanned"}
+        else None,
+        "next_tool": "start_netease_qr_login" if status == "expired" else None,
+    }
+
+
+def check_netease_qr_login(login_id: Any) -> str:
+    return _json_text(_check_netease_qr_login(login_id))
+
+
+def _valid_qr_login_id(login_id: str) -> bool:
+    return 16 <= len(login_id) <= 100 and all(
+        character.isalnum() or character in "-_" for character in login_id
+    )
+
+
+def _qr_login_page(login_id: str) -> str | None:
+    if not _valid_qr_login_id(login_id):
+        return None
+    now = time.monotonic()
+    with QR_LOGIN_LOCK:
+        _cleanup_qr_attempts(now)
+        attempt = QR_LOGIN_ATTEMPTS.get(login_id)
+        if attempt is None:
+            return None
+        qr_payload = str(attempt.get("qr_payload") or "")
+    image_data = base64.b64encode(qr_png(qr_payload)).decode("ascii")
+    return (
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>网易云音乐登录</title><style>"
+        "body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;"
+        "margin:0;background:#f6f7f9;color:#202124}.card{background:white;padding:2rem;"
+        "border-radius:1rem;box-shadow:0 8px 30px #0001;text-align:center;max-width:28rem}"
+        "img{width:min(72vw,300px);height:auto}.status{font-weight:600;margin-top:1rem}"
+        ".hint{color:#5f6368;line-height:1.5}</style></head><body><main class=\"card\">"
+        "<h1>网易云音乐登录</h1><p class=\"hint\">请使用网易云音乐 App 扫码并确认。</p>"
+        f"<img alt=\"网易云登录二维码\" src=\"data:image/png;base64,{image_data}\">"
+        "<p id=\"status\" class=\"status\">等待扫码</p>"
+        "<p id=\"hint\" class=\"hint\">页面会自动更新状态。</p></main><script>"
+        "const statusNode=document.getElementById('status');"
+        "const hintNode=document.getElementById('hint');"
+        "const labels={waiting:'等待扫码',scanned:'已扫码，请在 App 中确认',"
+        "confirmed:'登录成功，可以关闭页面',expired:'二维码已过期，请返回 ChatGPT 重新开始',"
+        "security_verification_required:'网易云要求额外安全验证，请返回 ChatGPT 重新开始',"
+        "upstream_unknown:'网易云返回了暂不识别的状态，请返回 ChatGPT 查看详情'};"
+        "let stopped=false;async function poll(){if(stopped)return;try{"
+        "const response=await fetch(location.pathname.replace(/\\/$/,'')+'/status',"
+        "{cache:'no-store',credentials:'omit'});const data=await response.json();"
+        "statusNode.textContent=labels[data.status]||'正在检查';"
+        "if(['confirmed','expired','security_verification_required','upstream_unknown',"
+        "'invalid_or_expired'].includes(data.status)){stopped=true;hintNode.textContent="
+        "data.status==='confirmed'?'登录凭据已安全保存，浏览器未收到 Cookie。':'本页面已停止轮询。';}"
+        "}catch(_){statusNode.textContent='暂时无法检查，请稍候';}"
+        "if(!stopped)setTimeout(poll,2500);}setTimeout(poll,800);</script></body></html>"
     )
 
 
@@ -1114,7 +1281,19 @@ def _redact_secrets(message: Any) -> str:
     for secret in (NETEASE_COOKIE, ACCESS_TOKEN, OAUTH_PASSWORD):
         if secret:
             text = text.replace(secret, "[REDACTED]")
-    for cookie_name in ("MUSIC_U", "__csrf", "NMTID"):
+    for cookie_name in (
+        "MUSIC_U",
+        "__csrf",
+        "JSESSIONID-WYYY",
+        "_iuqxldmzr_",
+        "_ntes_nnid",
+        "_ntes_nuid",
+        "NMTID",
+        "WEVNSM",
+        "WNMCID",
+        "ydDeviceToken",
+        "sDeviceId",
+    ):
         marker = cookie_name + "="
         start = text.find(marker)
         while start >= 0:
@@ -4160,6 +4339,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
+            "base-uri 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -4268,6 +4453,45 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path.rstrip("/") or "/"
+        login_route = re.fullmatch(
+            r"/netease/login/([A-Za-z0-9_-]{16,100})(/status)?", path
+        )
+        if login_route:
+            login_id = login_route.group(1)
+            if login_route.group(2):
+                with QR_LOGIN_LOCK:
+                    _cleanup_qr_attempts(time.monotonic())
+                    exists = login_id in QR_LOGIN_ATTEMPTS
+                if not exists:
+                    self._json(
+                        {"status": "invalid_or_expired"},
+                        HTTPStatus.GONE,
+                        {"Cache-Control": "no-store"},
+                    )
+                    return
+                try:
+                    result = _check_netease_qr_login(login_id)
+                except NetEaseError as exc:
+                    self._json(
+                        {
+                            "status": "upstream_error",
+                            "message": _redact_secrets(exc),
+                        },
+                        HTTPStatus.BAD_GATEWAY,
+                        {"Cache-Control": "no-store"},
+                    )
+                    return
+                self._json(result, headers={"Cache-Control": "no-store"})
+                return
+            content = _qr_login_page(login_id)
+            if content is None:
+                self._html(
+                    "<h1>登录链接无效或已过期</h1><p>请返回 ChatGPT 重新开始网易云登录。</p>",
+                    HTTPStatus.GONE,
+                )
+                return
+            self._html(content)
+            return
         if path == "/mcp":
             # This server is intentionally stateless and does not expose an SSE
             # listener. Streamable HTTP permits a 405 response when GET streams
@@ -4457,7 +4681,13 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             )
 
     def log_message(self, format_string: str, *args: Any) -> None:
-        LOG.info("%s - %s", self.client_address[0], format_string % args)
+        message = format_string % args
+        message = re.sub(
+            r"/netease/login/[A-Za-z0-9_-]{16,100}",
+            "/netease/login/[REDACTED]",
+            message,
+        )
+        LOG.info("%s - %s", self.client_address[0], message)
 
 
 class ThreadingHTTPServer(http.server.ThreadingHTTPServer):

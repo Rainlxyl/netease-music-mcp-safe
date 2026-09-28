@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import secrets
+import string
 import threading
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -16,6 +19,10 @@ from persistence import PersistentStore, utc_now
 
 
 SESSION_COOKIE_NAMES = ("MUSIC_U", "__csrf")
+WEB_QR_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) "
+    "Gecko/20100101 Firefox/152.0"
+)
 _WEAPI_IV = b"0102030405060708"
 _WEAPI_PRESET_KEY = b"0CoJUm6Qyw8W8jud"
 _WEAPI_BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -58,21 +65,65 @@ def cookie_fingerprint(cookie: str) -> str:
 def cookie_from_login_response(
     set_cookie_headers: list[str] | tuple[str, ...] | None,
     body_cookie: Any = None,
+    *,
+    base_cookie: str = "",
 ) -> str:
     """Extract the allowlisted session cookies without exposing other response cookies."""
-    values: dict[str, str] = {}
-    if isinstance(body_cookie, str):
-        values.update(parse_cookie(body_cookie))
+    return normalize_session_cookie(
+        merge_cookie_values(base_cookie, set_cookie_headers, body_cookie)
+    )
+
+
+def merge_cookie_values(
+    base_cookie: str = "",
+    set_cookie_headers: list[str] | tuple[str, ...] | None = None,
+    body_cookie: Any = None,
+) -> str:
+    """Merge Cookie/Set-Cookie values with deterministic last-value-wins semantics."""
+    values = parse_cookie(base_cookie)
     for header in set_cookie_headers or ():
         if not isinstance(header, str):
             continue
         first_part = header.split(";", 1)[0]
         name, separator, value = first_part.partition("=")
-        if separator and name.strip() in SESSION_COOKIE_NAMES:
+        if separator and name.strip():
             values[name.strip()] = value.strip()
-    return "; ".join(
-        f"{name}={values[name]}" for name in SESSION_COOKIE_NAMES if values.get(name)
-    )
+    if isinstance(body_cookie, str):
+        values.update(parse_cookie(body_cookie))
+    return "; ".join(f"{name}={value}" for name, value in values.items() if value)
+
+
+def create_web_qr_context(now_ms: int | None = None) -> dict[str, str]:
+    """Create the short-lived browser identity shared by one web QR attempt."""
+    timestamp = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    alphabet = string.ascii_letters + string.digits + "-_"
+
+    def web_token(length: int) -> str:
+        return "".join(secrets.choice(alphabet) for _ in range(length))
+
+    def cookie_value(value: str) -> str:
+        return urllib.parse.quote(value, safe="~()*!.'-_")
+
+    nuid = secrets.token_hex(16)
+    cookies = {
+        "JSESSIONID-WYYY": web_token(190),
+        "_iuqxldmzr_": "33",
+        "_ntes_nnid": f"{nuid},{timestamp}",
+        "_ntes_nuid": nuid,
+        "NMTID": "00" + web_token(39),
+        "WEVNSM": "1.0.0",
+        "WNMCID": "".join(secrets.choice(string.ascii_lowercase) for _ in range(6))
+        + f".{timestamp}.01.0",
+    }
+    random_number = secrets.randbelow(1_000_000)
+    return {
+        "chain_id": f"v1_unknown-{random_number}_web_login_{timestamp}",
+        "temporary_cookie": "; ".join(
+            f"{name}={cookie_value(value)}" for name, value in cookies.items()
+        ),
+        "user_agent": WEB_QR_USER_AGENT,
+        "yd_device_token": "",
+    }
 
 
 def _pkcs7_pad(value: bytes) -> bytes:

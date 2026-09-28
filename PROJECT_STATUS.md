@@ -3,6 +3,24 @@
 最后更新：2026-09-28
 状态维护者：项目协作者
 
+## 2026-09-28 web QR 协议兼容与浏览器登录 checkpoint
+
+- 第一次真实 Zeabur 验收证明 OAuth、SQLite、QR key、PNG 与扫码入口可用，但确认后的未知 QR
+  code 被第一版折叠为通用错误，session 未持久化。本轮只做本地实现和 mock/synthetic 验证，
+  未再次使用真实网易云账号，也未 commit、push 或 deploy。
+- QR flow 已切换为 web 语义：`type=1`、`noCheckToken`、`chainId`、web headers、临时浏览器
+  Cookie 和 `/st/platform/scanlogin` URL 在同一 10 分钟 attempt 内连续使用。`803` 合并初始
+  context、响应 `Set-Cookie` 与 body cookie 后，仍只把 `MUSIC_U` / `__csrf` 存入 SQLite。
+- `start_netease_qr_login` 现在优先返回基于既有 `MCP_PUBLIC_URL` 的短期高熵 `login_url`；
+  简单 HTML 页面显示 QR 并以 2.5 秒间隔调用与 MCP 相同的检查函数。成功、过期及 `8821`
+  会使 URL 失效；access log 隐去 URL token，浏览器不接收最终 Cookie。
+- QR 状态明确支持 800/801/802/803/8821；未知数字 code 返回脱敏的
+  `upstream_unknown`，不再丢失诊断信息。`8821` 只报告
+  `security_verification_required` 并停止轮询，不实现安全验证绕过。
+- 本地完整 mock 测试当前 111/111 通过；仓库环境检查、Python compile、`pip check` 与
+  `git diff --check` 均通过。旧 `NETEASE_COOKIE` fallback、session manager、OAuth scope、
+  SQLite schema 和原音乐工具没有重设计。
+
 ## 2026-09-28 网易云登录态自动管理 checkpoint
 
 - canonical working tree：`repo_checkout`，分支 `main`，任务开始时 HEAD `2d72f141e2337d2f4539cb846dc32ffe8d5ecfca`，origin 为 `Rainlxyl/netease-music-mcp-safe`。未修改 `upstream_reference` 或项目外壳目录。
