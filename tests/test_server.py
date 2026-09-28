@@ -2956,6 +2956,8 @@ class HTTPTests(unittest.TestCase):
         self.assertIn("https://c.dun.163.com", directives["script-src"])
         self.assertIn("https://c.dun.163yun.com", directives["script-src"])
         self.assertIn("https://*.nstool.netease.com", directives["script-src"])
+        self.assertIn("'unsafe-eval'", directives["script-src"])
+        self.assertIn("https://da.dun.163.com", directives["img-src"])
         self.assertIn("https://fp-upload.dun.163.com", directives["connect-src"])
         all_sources = {
             source for sources in directives.values() for source in sources
@@ -3351,6 +3353,7 @@ class OAuthHTTPTests(unittest.TestCase):
             "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
             "base-uri 'none'; frame-ancestors 'none'",
         )
+        self.assertNotIn("'unsafe-eval'", authorization_csp)
 
     def test_authorization_code_pkce_and_refresh_flow(self):
         client = self.register()

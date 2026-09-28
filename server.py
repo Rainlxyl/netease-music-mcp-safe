@@ -105,12 +105,18 @@ QR_LOGIN_TTL_SECONDS = 10 * 60
 QR_LOGIN_MIN_CHECK_SECONDS = 2
 NETEASE_YIDUN_CAPTCHA_ID = "73a18dc827b24b18ad0783701a75277d"
 NETEASE_DEVICE_APP_ID = "9d0ef7e0905d422cba1ecf7e73d77e67"
+# NetEase's official Yidun browser SDK currently uses dynamic Function during
+# initialization. Keep unsafe-eval scoped to this short-lived, high-entropy
+# login capability page only; OAuth and every other HTTP surface retain the
+# default CSP without it. Remove this exception if the official SDK stops
+# requiring dynamic evaluation.
 NETEASE_LOGIN_CSP = (
     "default-src 'none'; img-src data: https://cstaticdun.126.net "
     "https://cstaticdun1.126.net https://acstatic-dun.126.net "
     "https://necaptcha.nosdn.127.net https://necaptcha1.nosdn.127.net "
-    "https://nos.netease.com https://c.dun.163.com https://c.dun.163yun.com; "
-    "style-src 'unsafe-inline'; script-src 'unsafe-inline' https://cstaticdun.126.net "
+    "https://nos.netease.com https://c.dun.163.com https://c.dun.163yun.com "
+    "https://da.dun.163.com; style-src 'unsafe-inline'; "
+    "script-src 'unsafe-inline' 'unsafe-eval' https://cstaticdun.126.net "
     "https://cstaticdun1.126.net https://st.music.163.com "
     "https://acstatic-dun.126.net https://c.dun.163.com https://c.dun.163yun.com "
     "https://*.nstool.netease.com; connect-src 'self' https://c.dun.163.com "
