@@ -2931,6 +2931,11 @@ class HTTPTests(unittest.TestCase):
         self.assertIn("yd_device_token", body)
         self.assertIn("captcha_init_timeout", body)
         self.assertIn("sdk_load_failed", body)
+        self.assertIn("sdk_unavailable", body)
+        self.assertIn("captcha_init_failed", body)
+        self.assertIn("captcha_runtime_error", body)
+        self.assertIn("}},30000);", body)
+        self.assertNotIn("}},10000);", body)
         self.assertIn("onClose", body)
         self.assertIn("onError", body)
         self.assertIn("current!==flowId", body)
@@ -2970,6 +2975,100 @@ class HTTPTests(unittest.TestCase):
         result = subprocess.run(
             ["node", "--check", "-"],
             input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_browser_challenge_timeout_retry_and_stale_callback_guards(self):
+        if shutil.which("node") is None:
+            self.skipTest("Node.js is not available for browser-flow validation")
+        login_id = "browser-challenge-timing-token"
+        self.add_browser_login_attempt(login_id)
+        page = self.module._qr_login_page(login_id)
+        script = page.rsplit("<script>", 1)[1].split("</script>", 1)[0]
+        harness = r"""
+const listeners={};
+const pageListeners={};
+const nodes={
+  status:{textContent:''},hint:{textContent:''},captcha:{},
+  verify:{hidden:true,addEventListener:(name,fn)=>{listeners.verify=fn;}},
+  cancel:{hidden:false,addEventListener:(name,fn)=>{listeners.cancel=fn;}}
+};
+let virtualNow=0,nextTimer=1;
+const pendingTimers=new Map();
+global.window=global;
+global.location={pathname:'/netease/login/browser-challenge-timing-token'};
+global.document={
+  getElementById:(id)=>nodes[id],
+  createElement:()=>({remove(){this.removed=true;}}),
+  head:{appendChild:()=>{}}
+};
+global.addEventListener=(name,fn)=>{pageListeners[name]=fn;};
+global.setTimeout=(fn,delay)=>{const id=nextTimer++;pendingTimers.set(id,{fn,at:virtualNow+delay});return id;};
+global.clearTimeout=(id)=>{pendingTimers.delete(id);};
+const requests=[];
+global.fetch=(url,options)=>{requests.push({url,options});return Promise.resolve({json:()=>Promise.resolve({status:'cancelled'})});};
+const warnings=[];
+console.warn=(...args)=>{warnings.push(args);};
+function assert(condition,message){if(!condition)throw new Error(message);}
+async function flush(){await Promise.resolve();await Promise.resolve();}
+async function advance(milliseconds){
+  virtualNow+=milliseconds;
+  while(true){
+    const due=[...pendingTimers.entries()].filter(([,item])=>item.at<=virtualNow).sort((a,b)=>a[1].at-b[1].at);
+    if(!due.length)break;
+    for(const [id,item] of due){if(pendingTimers.delete(id)){item.fn();await flush();}}
+  }
+}
+"""
+        checks = r"""
+if(timer){clearTimeout(timer);timer=null;}
+const invocations=[];
+window.initNECaptcha=(options,success,failure)=>{invocations.push({options,success,failure});};
+(async()=>{
+  const runtimeFailure=openChallenge();await flush();
+  assert(invocations.length===1,'challenge was not initialized');
+  invocations[0].options.onError({code:'E_RUNTIME',message:'MUSIC_U=must-not-log'});
+  await runtimeFailure;
+  assert(statusNode.textContent==='安全验证运行失败','SDK onerror was not classified immediately');
+  assert(verifyButton.hidden===false&&!stopped,'runtime failure did not remain retryable');
+  assert(JSON.stringify(warnings).includes('captcha_runtime_error'),'runtime category was not diagnosed');
+  assert(!JSON.stringify(warnings).includes('must-not-log'),'unsafe SDK message reached console');
+
+  const delayed=openChallenge();await flush();
+  assert(invocations.length===2,'retry did not initialize challenge');
+  await advance(10000);
+  assert(statusNode.textContent!=='安全验证初始化超时','10 seconds caused a premature timeout');
+  await advance(10000);
+  let delayedPopup=0;
+  invocations[1].success({popUp:()=>{delayedPopup++;},destroy:()=>{}});
+  await delayed;
+  assert(delayedPopup===1&&statusNode.textContent==='请完成网易安全验证','20-second initialization did not succeed');
+  invocations[1].options.onClose();
+
+  const timedOut=openChallenge();await flush();
+  assert(invocations.length===3,'timeout scenario did not initialize challenge');
+  await advance(29999);
+  assert(statusNode.textContent!=='安全验证初始化超时','challenge timed out before 30 seconds');
+  await advance(1);await timedOut;
+  assert(statusNode.textContent==='安全验证初始化超时','challenge did not time out at 30 seconds');
+  assert(verifyButton.hidden===false&&!stopped,'timeout did not preserve a retryable attempt');
+
+  const retry=listeners.verify();await flush();
+  assert(invocations.length===4,'timeout retry button did not reopen challenge');
+  let stalePopup=0,staleDestroyed=0;
+  listeners.cancel();
+  invocations[3].success({popUp:()=>{stalePopup++;},destroy:()=>{staleDestroyed++;}});
+  await retry;
+  assert(stopped&&stalePopup===0&&staleDestroyed===1,'stale callback revived a cancelled flow');
+  assert(requests.length===1,'challenge failures unexpectedly cancelled the server attempt');
+})().catch(error=>{process.stderr.write(error.stack+'\n');process.exitCode=1;});
+"""
+        result = subprocess.run(
+            ["node", "-"],
+            input=harness + script + checks,
             text=True,
             capture_output=True,
             check=False,
