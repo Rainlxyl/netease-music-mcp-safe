@@ -12,6 +12,7 @@
 | DEC-004 | 2026-08-07 | active | 托管访问使用 OAuth 授权码流程与 PKCE S256 | 无 |
 | DEC-005 | 2026-08-07 | active | 写入采用单次调用、服务端审计与显式幂等 | 无 |
 | DEC-006 | 2026-08-07 | active | UTC 规范存储，IANA 时区仅派生展示语义 | 无 |
+| DEC-007 | 2026-09-28 | active | 网易云登录态由持久 session 优先、环境变量回退统一管理 | 无 |
 
 ## 决策记录
 
@@ -100,5 +101,19 @@
 - 证据：提交 `1e3da513`；`server.py` 的 timezone helper；`tests/test_server.py` 的时区回归测试；`README.md` 的“时间与时区”。
 - 影响：不得使用固定偏移量替代 IANA 名称，也不得声称服务端时区能改变网易云日推内容或刷新时间。
 - 重新考虑条件：引入经过设计的每用户或每调用时区，并继续保持 UTC 规范存储。
+- 替代：无
+- 被替代：无
+
+### DEC-007：网易云登录态由持久 session 优先、环境变量回退统一管理
+
+- 日期：2026-09-28
+- 状态：active
+- 决策：所有网易云请求统一从 session manager 取得 Cookie 与 CSRF；优先使用 SQLite 中有效的 runtime session，其次验证并可导入 `NETEASE_COOKIE`，均不可用时返回机器可识别的认证错误。二维码登录按“生成 key / 返回安全二维码 payload / 客户端扫码 / 显式查询状态 / 成功后持久化”执行，不启动后台高频轮询。登录验证结果缓存 15 分钟；模糊 403 必须结合一次登录态验证后才能归类为 `NETEASE_AUTH_EXPIRED`。
+- 背景：旧实现直接读取进程级 `NETEASE_COOKIE`，Cookie 失效后通常只暴露上游 `403 illegal request`，恢复登录需要人工提取 Cookie、改 Zeabur 环境变量并重新部署。
+- 理由：运行时 session 持久化可在不重新部署的情况下恢复登录；环境变量回退保持已有部署兼容；显式状态查询和验证缓存降低网易云登录接口的调用频率；统一错误语义避免把所有 403 误判为登录过期。
+- 存储与安全边界：SQLite 只保存登录必需的 `MUSIC_U`、`__csrf` 及非秘密元数据。当前单实例个人部署已依赖服务端持久卷和管理面访问控制，因此不新增需要轮换和备份的应用层加密密钥；数据库、WAL 和备份必须按秘密处理，并限制文件权限。日志、MCP 结果和异常不得包含 Cookie、token 或 CSRF。
+- 证据：`netease_session.py`、`persistence.py`、`server.py`、`tests/test_server.py`、`README.md` 与 `SECURITY.md` 的当前工作区实现。
+- 影响：二维码登录需要既有 `MCP_STORAGE_PATH` 指向持久卷；OAuth 客户端需要 `netease.session` scope；登出会写入 tombstone，阻止旧环境变量 Cookie 立即复活，直到新的二维码登录成功。
+- 重新考虑条件：部署模型变为多租户/多实例、持久卷不再具备可信访问边界，或上游二维码/验证协议发生变化。
 - 替代：无
 - 被替代：无

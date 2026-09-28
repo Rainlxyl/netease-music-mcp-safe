@@ -9,8 +9,8 @@ account writes.
 `netease-music-mcp-safe` 默认只读，可选开启经过校验、审计和幂等保护的写入能力；它让
 调用模型读取音乐上下文、解释选择，并把确认后的策展结果安全地写回个人账户。
 
-**一眼看懂：** **16 read tools + 12 write tools** · 日推 / 播放排行 / 近期播放 · 每日策展
-工作流 · 播客读取 · OAuth 2.1 + PKCE · 时区感知 · 幂等审计写入 · **88 项测试**
+**一眼看懂：** **16 music read tools + 4 session tools + 12 write tools** · 日推 / 播放排行 /
+近期播放 · 每日策展工作流 · 播客读取 · OAuth 2.1 + PKCE · 自动登录态管理 · **102 项测试**
 
 **项目身份：** 这是一个个人维护的独立开源项目，派生自
 [Vael-KY/netease-music-mcp](https://github.com/Vael-KY/netease-music-mcp)，依据 MIT License
@@ -59,29 +59,31 @@ flowchart TB
     Client["ChatGPT / Codex"]
     Auth["OAuth 2.1 + PKCE<br/>or Bearer authentication"]
     MCP["NetEase Music MCP<br/>one deployment = one NetEase account"]
-    Cookie["NETEASE_COOKIE<br/>deployment environment only"]
+    Cookie["NETEASE_COOKIE<br/>optional compatibility fallback"]
+    Session["Session Manager<br/>verify / select / invalidate"]
     API["Unofficial NetEase Web API"]
-    SQLite["SQLite<br/>audit / private notes / idempotency<br/>does not store NETEASE_COOKIE"]
+    SQLite["Persistent SQLite<br/>NetEase session / audit / notes / idempotency"]
     Timezone["MCP_DEFAULT_TIMEZONE<br/>user-facing time context"]
     Region["Deployment region<br/>does not select user-facing timezone"]
 
     Client --> Auth --> MCP
-    Cookie --> MCP
+    Cookie --> Session --> MCP
     MCP --> API
+    Session <--> SQLite
     MCP --> SQLite
     Timezone --> MCP
     Region -. does not determine .-> Timezone
 ```
 
-`NETEASE_COOKIE` 只存在于服务端部署环境，SQLite 保存的是脱敏审计、私人备注和幂等状态，
-不保存网易云 Cookie。面向用户的本地时间由 `MCP_DEFAULT_TIMEZONE` 决定，部署地区或主机
-时区不会替用户选择日期语境。
+推荐流程由二维码登录产生 runtime session，并存入持久 SQLite；`NETEASE_COOKIE` 只作为旧部署
+兼容 fallback。SQLite 因此属于敏感数据，备份和卷访问权限应按凭据处理。面向用户的本地时间
+由 `MCP_DEFAULT_TIMEZONE` 决定，部署地区或主机时区不会替用户选择日期语境。
 
 ## Quick Start
 
 1. Fork 或 clone 本仓库。
-2. 只通过自己控制的浏览器和网易云账户会话准备自己的 `NETEASE_COOKIE`；不要把凭据交给
-   第三方网站，也不要发到聊天、截图或公开 issue。
+2. 挂载持久卷并设置 `MCP_STORAGE_PATH`，连接 MCP 后运行 `start_netease_qr_login`，用网易云
+   App 扫码确认，再运行 `check_netease_qr_login`。以后 session 会自动持久化。
 3. 以 `.env.example` 为配置清单填写自己的环境变量。仓库中的示例只有 placeholder；真实
    `.env` 和 secrets **绝对不能 commit**。本服务不会自动加载 `.env`，请通过 shell、进程
    管理器或部署平台把变量导入进程环境。
@@ -97,16 +99,16 @@ flowchart TB
 
 > **当前架构：one deployment → one NetEase account。**
 
-`NETEASE_COOKIE` 是 server process 启动时读取的 deployment-level environment variable。
-OAuth 或 Bearer authentication 控制的是“谁能访问这个 MCP deployment”，不是为每位访问者
-建立独立网易云登录的多租户系统。
+网易云登录态是 deployment-level session：优先使用 SQLite 中已持久化的有效 runtime session，
+再回退到 server process 启动时读取的 `NETEASE_COOKIE`。OAuth 或 Bearer authentication 控制
+的是“谁能访问这个 MCP deployment”，不是为每位访问者建立独立网易云登录的多租户系统。
 
 因此：
 
 - 不建议多人共享同一个私人 deployment；
 - 分享项目时应分享 GitHub repository，而不是自己的 MCP password、Bearer token 或
   `NETEASE_COOKIE`；
-- 朋友或其他使用者应部署自己的实例，并设置自己的 `NETEASE_COOKIE`；
+- 朋友或其他使用者应部署自己的实例，并通过自己的网易云 App 扫码登录；
 - 如果多人获得同一部署的访问权，他们实际访问和可能修改的是该部署所配置的同一个网易云
   账户；
 - SQLite 中按网易云 user ID 隔离的审计与备注，不能把单账号 deployment 自动变成多账号
@@ -124,6 +126,7 @@ OAuth 或 Bearer authentication 控制的是“谁能访问这个 MCP deployment
 - [项目起点](#项目起点)
 - [从推荐列表到每日策展](#从推荐列表到每日策展)
 - [当前已实现](#当前已实现)
+- [网易云登录与自动持久化](#网易云登录与自动持久化)
 - [产品与可靠性设计](#产品与可靠性设计)
 - [安全边界与 OAuth](#安全边界与-oauth)
 - [配置与本地运行](#配置与本地运行)
@@ -197,8 +200,9 @@ create_curated_playlist 一次创建并核验
 
 ## 当前已实现
 
-服务端当前注册 **16 个读取工具**和 **12 个写入工具**。`MCP_READ_ONLY=true` 是默认值，
-此时所有写入工具都不会出现在 `tools/list` 中。
+服务端当前注册 **16 个音乐读取工具**、**4 个登录态工具**和 **12 个账户写入工具**。
+`MCP_READ_ONLY=true` 是默认值，此时账户写入工具不会出现在 `tools/list` 中，登录态工具仍然
+可用。
 
 ### 读取工具
 
@@ -223,6 +227,15 @@ create_curated_playlist 一次创建并核验
 
 `get_playlist_songs` 会使用完整的上游 `trackIds` 列表，再只获取所需页面的歌曲详情，避免
 把歌单详情响应中可能截断的 `tracks` 当成完整歌单。
+
+### 登录态工具
+
+| 工具 | 当前接口与语义 |
+| --- | --- |
+| `get_netease_login_status` | 使用 15 分钟验证缓存检查当前 session；只返回状态、来源和时间，不返回 Cookie、CSRF 或 token。 |
+| `start_netease_qr_login` | 获取二维码 key；MCP 结果同时返回文字说明、可直接打开的网易云 HTTPS `qr_url` 和 PNG 二维码 image content；要求配置持久 SQLite。 |
+| `check_netease_qr_login` | 返回 `waiting`、`scanned`、`confirmed` 或 `expired`；确认后自动提取并持久化 session。服务端限制最短检查间隔，不后台轮询。 |
+| `logout_netease` | 清空持久 runtime session 并记录 logged-out 状态，避免旧环境变量在同一数据库上立即恢复登录。 |
 
 ### 写入工具
 
@@ -365,6 +378,41 @@ get_recent_podcast_plays
 分页，也不提供可靠的个人节目播放次数、收听进度或是否听完。只有上游实际提供
 `playTime` 时才会产生 `played_at*` 字段，不会为缺失数据伪造时间。
 
+## 网易云登录与自动持久化
+
+### 推荐方式：二维码登录
+
+1. 部署时挂载持久卷，并令 `MCP_STORAGE_PATH` 指向卷内 SQLite 文件。
+2. 首次连接后调用 `start_netease_qr_login`。
+3. MCP 结果包含文字字段（`login_id`、`qr_payload`、可直接打开的网易云 HTTPS `qr_url`）和
+   一个 PNG image content。ChatGPT 可直接向用户展示该图片，不需要假设客户端会自行把文字
+   payload 转成二维码；用户只在网易云 App 中扫码并确认。
+4. 调用 `check_netease_qr_login(login_id=...)`。`waiting` 表示等待扫码，`scanned` 表示已扫码待
+   确认，`confirmed` 表示 session 已自动持久化，`expired` 则重新开始。
+5. 后续音乐工具自动使用新 session；Cookie 失效时会返回机器可理解的
+   `NETEASE_AUTH_EXPIRED`，提示重新运行二维码流程。
+
+正常情况下，用户不再需要打开浏览器 DevTools 查找 `MUSIC_U` 或 `__csrf`，也不需要为重新
+登录修改 Zeabur 环境变量或重新部署。二维码工具不会把 Cookie、`MUSIC_U`、`__csrf` 或其他
+登录 token 返回给 ChatGPT。
+
+### 兼容方式：环境变量 Cookie
+
+旧部署仍可继续设置 `NETEASE_COOKIE`。优先级为：已持久化且可用的 runtime session → 环境
+变量 Cookie → 明确提示二维码登录。环境变量 session 首次通过账号验证后，如果配置了
+`MCP_STORAGE_PATH`，会安全导入 SQLite；此后二维码刷新可以覆盖它，而无需改环境变量。
+
+所有 Cookie 解析使用 last-value-wins 语义，持久化时只保留 `MUSIC_U` 和最后一个 `__csrf`；
+写接口的 `csrf_token` 直接从当前 session 自动提取，不要求单独维护 CSRF。
+
+### 错误语义与验证频率
+
+- 明确未登录响应返回 `NETEASE_AUTH_EXPIRED`；
+- `403 illegal request` 会先验证当前 session，只有验证确实失败才归类为 auth expired；
+- session 仍有效时返回 `NETEASE_REQUEST_REJECTED`；其他 HTTP/API 故障保持普通上游错误；
+- 写入前使用 15 分钟验证缓存，避免每次操作额外调用登录接口；
+- QR 状态只在调用 `check_netease_qr_login` 时查询，最短间隔 2 秒，不运行后台高频轮询。
+
 ## 产品与可靠性设计
 
 ### 产品原则
@@ -408,13 +456,13 @@ get_recent_podcast_plays
 - Streamable HTTP 为无状态模式，不声明无法维护的 session 或 SSE 流。
 - 工具失败作为 MCP error content 返回，不因单个上游失败破坏聊天消息流。
 - `/health` 只返回状态、读写模式和时区，不返回 Cookie、Token 或密码。
-- Cookie 只从服务端环境变量读取；服务面向个人账户使用，网易云 Cookie 本身等同于账户
-  访问凭据。
+- Cookie 只从服务端环境变量或持久 SQLite session 读取；服务面向个人账户使用，网易云
+  Cookie 本身等同于账户访问凭据，绝不返回给 MCP 客户端。
 
 ### OAuth 2.1、PKCE 与密钥边界
 
 托管客户端可使用 OAuth 2.1 授权码流程。当前实现提供受保护资源与授权服务器元数据、
-动态客户端注册、`netease.read` / `netease.write` scope、刷新令牌，并强制
+动态客户端注册、`netease.read` / `netease.session` / `netease.write` scope、刷新令牌，并强制
 PKCE `S256`。授权码有效 5 分钟且只能使用一次；access token 有效 1 小时，refresh token
 有效 30 天。
 
@@ -425,6 +473,9 @@ OAuth 是可选的：必须同时设置 `MCP_PUBLIC_URL` 与 `MCP_OAUTH_PASSWORD
 敏感信息应各自停留在正确边界：
 
 - `NETEASE_COOKIE`：只放在本地或 Zeabur 服务端环境中；不要发到聊天、截图或日志。
+- `MCP_STORAGE_PATH` 指向的 SQLite：现在也包含网易云 session；数据库、WAL/SHM 和备份均按
+  凭据保护。当前个人单实例部署不额外引入数据库加密密钥，以免密钥轮换导致 session 和
+  审计不可恢复；卷或主机读取权限本身必须限制在服务账户和平台管理员边界。
 - `MCP_ACCESS_TOKEN`：服务端持有；本地 Codex 可通过本机环境变量读取同一值，不要把
   字面量提交到配置文件。
 - `MCP_OAUTH_PASSWORD`：只在本服务自己的浏览器授权页输入；不要填入 ChatGPT app 配置。
@@ -452,7 +503,7 @@ OAuth 是可选的：必须同时设置 `MCP_PUBLIC_URL` 与 `MCP_OAUTH_PASSWORD
 
 | 变量 | 默认值 / 约束 | 用途 |
 | --- | --- | --- |
-| `NETEASE_COOKIE` | 无默认值；实际调用需包含 `MUSIC_U` | 网易云会话，常见格式为 `MUSIC_U=...; __csrf=...`。 |
+| `NETEASE_COOKIE` | 可选兼容 fallback；需包含 `MUSIC_U` | 旧部署的网易云会话；推荐改用二维码登录。 |
 | `MCP_ACCESS_TOKEN` | 必填；至少 24 字符 | 静态 Bearer token，也是 OAuth 签名密钥的根秘密。 |
 | `MCP_PUBLIC_URL` | 可选；HTTPS origin | 与 `MCP_OAUTH_PASSWORD` 同时设置时启用浏览器 OAuth。 |
 | `MCP_OAUTH_PASSWORD` | 可选；至少 16 字符，且不同于 access token | 一次浏览器授权时在服务端授权页输入。 |
@@ -462,7 +513,7 @@ OAuth 是可选的：必须同时设置 `MCP_PUBLIC_URL` 与 `MCP_OAUTH_PASSWORD
 | `MCP_ALLOWED_ORIGIN` | 空 | 仅在确有浏览器跨域需求时设置单个允许 origin。 |
 | `MCP_MAX_REQUEST_BYTES` | `1048576`；至少 1024 | HTTP 请求体上限。 |
 | `MCP_DEFAULT_TIMEZONE` | `Asia/Shanghai`；有效 IANA 名称 | 本地展示和日期语言语境；UTC 仍是规范存储时间。 |
-| `MCP_STORAGE_PATH` | 空；写入模式必填 | SQLite 文件；生产环境必须放在持久卷。 |
+| `MCP_STORAGE_PATH` | 空；二维码登录或写入模式必填 | session、审计、备注和幂等 SQLite；生产环境必须放在持久卷。 |
 | `MCP_OPERATION_RETENTION_DAYS` | `90`；范围 1–3650 | 审计保留天数。 |
 | `MCP_MAX_OPERATION_LOGS` | `1000`；范围 100–100000 | 每个用户的审计记录上限。 |
 | `MCP_MAX_IMAGE_BYTES` | `5242880`；范围 1–20 MiB | 封面压缩输入上限。 |
@@ -488,9 +539,9 @@ py -V:3.13 -m venv .venv
 {"status": "ok", "mode": "read-only", "timezone": "Asia/Shanghai"}
 ```
 
-写入模式必须为 `MCP_STORAGE_PATH` 提供持久 SQLite 路径。数据库包含私人备注与脱敏操作
-历史；迁移或卸载前应在服务停止时做卷快照或 SQLite 一致性备份。删除数据库不会修改
-网易云数据，但会永久删除本地备注与审计记录。
+二维码登录和写入模式必须为 `MCP_STORAGE_PATH` 提供持久 SQLite 路径。数据库包含网易云
+session、私人备注与脱敏操作历史；迁移或卸载前应在服务停止时做卷快照或 SQLite 一致性
+备份。删除数据库不会修改网易云数据，但会清除登录态并永久删除本地备注与审计记录。
 
 ## 部署到 Zeabur
 
@@ -498,25 +549,24 @@ py -V:3.13 -m venv .venv
 2. `zbpack.json` 已配置构建命令 `python -m unittest discover -s tests -v` 和启动命令
    `python server.py`；Zeabur 通过 `PORT` 提供端口。
 3. 首次部署至少设置：
-   - `NETEASE_COOKIE`
    - 随机生成、至少 24 字符的 `MCP_ACCESS_TOKEN`
    - `MCP_HOST=0.0.0.0`
    - `MCP_READ_ONLY=true`
    - `MCP_DEFAULT_TIMEZONE=Asia/Shanghai`（或你的 IANA 时区）
+   - 挂载 `/data` 持久卷并设置 `MCP_STORAGE_PATH=/data/netease-music-mcp.sqlite3`
 4. 如需 ChatGPT 浏览器 OAuth，再设置：
    - `MCP_PUBLIC_URL=https://YOUR-DOMAIN.zeabur.app`
    - 与 access token 不同、至少 16 字符的随机 `MCP_OAUTH_PASSWORD`
 5. 生成 HTTPS 域名，检查 `https://YOUR-DOMAIN/health`。MCP endpoint 为
    `https://YOUR-DOMAIN/mcp`；直接在浏览器打开它不是有效 MCP 测试，因为该 endpoint
    接受带认证的 JSON-RPC POST。
+6. 连接 MCP 后运行二维码登录工具；也可以继续用可选的 `NETEASE_COOKIE` 兼容旧部署。
 
-首次上线保持只读，先验证搜索、歌单、历史和日推。启用写入前：
+首次上线保持只读，先完成二维码登录并验证搜索、歌单、历史和日推。启用写入前：
 
-1. 挂载 `/data` 持久卷；
-2. 设置 `MCP_STORAGE_PATH=/data/netease-music-mcp.sqlite3`；
-3. 使用卷快照或 SQLite 一致性备份现有数据库；
-4. 设置 `MCP_READ_ONLY=false` 并重新部署；
-5. 刷新 ChatGPT 工具定义，断开再重连并确认授权页明确列出写权限。
+1. 使用卷快照或 SQLite 一致性备份现有数据库；
+2. 设置 `MCP_READ_ONLY=false` 并重新部署；
+3. 刷新 ChatGPT 工具定义，断开再重连并确认授权页明确列出写权限。
 
 一个 SQLite 文件只应由一个服务实例写入。当前版本不支持多个水平扩容副本共享同一
 SQLite 文件。
@@ -571,13 +621,15 @@ python -m py_compile server.py
 git diff --check
 ```
 
-当前测试套件规模为 **88 项**，覆盖核心读取、写入、OAuth/PKCE、时区、SQLite 迁移与
-持久化、幂等、审计、撤销、封面安全、工具分发和失败边界。2026-08-07 本地完整运行
-**88/88 通过**。网络调用均使用 mock；这项结果不等于真实网易云上游接口的持续可用性保证。
+当前测试套件规模为 **102 项**，覆盖核心读取、写入、OAuth/PKCE、时区、SQLite 迁移与
+持久化、session 优先级、Cookie/CSRF 解析、认证错误分类、二维码状态转换、幂等、审计、
+撤销、封面安全、工具分发和失败边界。网络调用均使用 mock；这项结果不等于真实网易云
+上游接口的持续可用性保证。
 
 ## 已知限制
 
 - 项目调用未公开的网易云 Web 接口；上游可能变化、失效或触发账户风控。应先测试只读工具。
+- 二维码接口同样是未公开接口；服务端不后台轮询，用户应在扫码或确认后再检查状态。
 - 最近播放可能缺少设备、完成状态或时间戳；服务端不会为缺失字段编造数据。
 - `get_play_history` 是按歌曲聚合的排行，不提供每次播放的时间；近期接口只支持最多 100
   条，没有 offset 或时间范围。

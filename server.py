@@ -29,6 +29,13 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from image_safety import normalize_cover_image, validate_file_reference
+from netease_session import (
+    SessionManager,
+    cookie_from_login_response,
+    parse_cookie,
+    qr_png,
+    weapi_encrypt,
+)
 from persistence import PersistentStore, utc_now
 
 
@@ -75,13 +82,24 @@ OPERATION_RETENTION_DAYS = int(os.environ.get("MCP_OPERATION_RETENTION_DAYS", "9
 MAX_OPERATION_LOGS = int(os.environ.get("MCP_MAX_OPERATION_LOGS", "1000"))
 MAX_IMAGE_BYTES = int(os.environ.get("MCP_MAX_IMAGE_BYTES", "5242880"))
 MAX_IMAGE_PIXELS = int(os.environ.get("MCP_MAX_IMAGE_PIXELS", "25000000"))
-OAUTH_SCOPE = "netease.read" if READ_ONLY else "netease.read netease.write"
+OAUTH_SCOPE = (
+    "netease.read netease.session"
+    if READ_ONLY
+    else "netease.read netease.session netease.write"
+)
 USED_AUTHORIZATION_CODES: dict[str, int] = {}
 USED_CODES_LOCK = threading.Lock()
 FAILED_LOGINS: dict[str, list[int]] = {}
 FAILED_LOGINS_LOCK = threading.Lock()
 STORE_INSTANCE: PersistentStore | None = None
 STORE_LOCK = threading.Lock()
+SESSION_MANAGER: SessionManager | None = None
+SESSION_MANAGER_LOCK = threading.Lock()
+SESSION_VERIFICATION_INTERVAL_SECONDS = 15 * 60
+QR_LOGIN_ATTEMPTS: dict[str, dict[str, Any]] = {}
+QR_LOGIN_LOCK = threading.Lock()
+QR_LOGIN_TTL_SECONDS = 10 * 60
+QR_LOGIN_MIN_CHECK_SECONDS = 2
 
 
 READ_TOOL_NAMES = {
@@ -115,6 +133,17 @@ WRITE_TOOL_NAMES = {
     "create_interaction_note",
     "update_interaction_note",
     "delete_interaction_note",
+}
+SESSION_TOOL_NAMES = {
+    "get_netease_login_status",
+    "start_netease_qr_login",
+    "check_netease_qr_login",
+    "logout_netease",
+}
+SESSION_MUTATING_TOOL_NAMES = {
+    "start_netease_qr_login",
+    "check_netease_qr_login",
+    "logout_netease",
 }
 
 
@@ -311,6 +340,34 @@ READ_TOOLS = [
         },
         ["playlist_id"],
     ),
+    _tool(
+        "get_netease_login_status",
+        "Check the deployment-level NetEase login without exposing cookies or tokens. Uses the verification cache when it is fresh.",
+    ),
+    _tool(
+        "start_netease_qr_login",
+        "Start NetEase App QR login. Returns a safe QR payload/URL and a login_id; never returns a cookie. Requires persistent SQLite storage.",
+        read_only=False,
+    ),
+    _tool(
+        "check_netease_qr_login",
+        "Check one QR login attempt. Call only after the user has scanned or after the returned retry interval; confirmed sessions are persisted automatically.",
+        {
+            "login_id": {
+                "type": "string",
+                "minLength": 16,
+                "maxLength": 100,
+            }
+        },
+        ["login_id"],
+        read_only=False,
+    ),
+    _tool(
+        "logout_netease",
+        "Clear the persisted NetEase runtime session and block the legacy environment fallback until a new QR login succeeds.",
+        read_only=False,
+        destructive=True,
+    ),
 ]
 
 WRITE_TOOLS = [
@@ -501,6 +558,28 @@ class NetEaseError(RuntimeError):
     pass
 
 
+class NetEaseAuthExpired(NetEaseError):
+    code = "NETEASE_AUTH_EXPIRED"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "NETEASE_AUTH_EXPIRED: The NetEase login is missing or expired. "
+            "Run start_netease_qr_login, scan with the NetEase App, then call "
+            "check_netease_qr_login."
+        )
+
+
+class NetEaseRequestRejected(NetEaseError):
+    code = "NETEASE_REQUEST_REJECTED"
+
+
+class NetEaseHTTPFailure(RuntimeError):
+    def __init__(self, status: int, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(f"NetEase returned HTTP {status}.")
+        self.status = status
+        self.payload = payload or {}
+
+
 class PodcastProgramNotFound(NetEaseError):
     code = "podcast_program_not_found"
 
@@ -535,17 +614,52 @@ class CuratedPlaylistFailure(NetEaseError):
         self.outcome_unknown = outcome_unknown
 
 
-def _require_cookie() -> None:
-    if not NETEASE_COOKIE or "MUSIC_U=" not in NETEASE_COOKIE:
-        raise NetEaseError("NetEase credentials are not configured.")
+def _optional_store() -> PersistentStore | None:
+    return _store() if STORAGE_PATH else None
 
 
-def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[str, Any]:
-    _require_cookie()
+def _session_manager() -> SessionManager:
+    global SESSION_MANAGER
+    if SESSION_MANAGER is None:
+        with SESSION_MANAGER_LOCK:
+            if SESSION_MANAGER is None:
+                SESSION_MANAGER = SessionManager(
+                    _optional_store,
+                    NETEASE_COOKIE,
+                    verification_interval_seconds=SESSION_VERIFICATION_INTERVAL_SECONDS,
+                )
+    return SESSION_MANAGER
+
+
+def _require_cookie() -> str:
+    cookie = _session_manager().get_cookie()
+    if not parse_cookie(cookie).get("MUSIC_U"):
+        raise NetEaseAuthExpired()
+    return cookie
+
+
+def _decode_netease_payload(raw: bytes) -> dict[str, Any]:
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise UpstreamOutcomeUnknown(
+            "NetEase returned an unreadable response; the result is unknown."
+        ) from None
+    if not isinstance(result, dict):
+        raise NetEaseError("NetEase returned an unexpected response.")
+    return result
+
+
+def _raw_netease_request(
+    url: str,
+    *,
+    cookie: str,
+    data: dict[str, Any] | str | None = None,
+) -> tuple[dict[str, Any], Any]:
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://music.163.com/",
-        "Cookie": NETEASE_COOKIE,
+        "Cookie": cookie,
         "Content-Type": "application/x-www-form-urlencoded" if data is not None else "application/json",
     }
     encoded: bytes | None = None
@@ -556,17 +670,125 @@ def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[
     request = urllib.request.Request(url, data=encoded, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            payload = response.read(2_000_000).decode("utf-8")
-            result = json.loads(payload)
-            if not isinstance(result, dict):
-                raise NetEaseError("NetEase returned an unexpected response.")
-            return result
+            return _decode_netease_payload(response.read(2_000_000)), response.headers
     except urllib.error.HTTPError as exc:
-        raise NetEaseError(f"NetEase request failed with HTTP {exc.code}.") from None
+        try:
+            payload = _decode_netease_payload(exc.read(2_000_000))
+        except (NetEaseError, UpstreamOutcomeUnknown):
+            payload = {}
+        raise NetEaseHTTPFailure(exc.code, payload) from None
     except urllib.error.URLError:
         raise UpstreamOutcomeUnknown("NetEase could not be reached; the result is unknown.") from None
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise UpstreamOutcomeUnknown("NetEase returned an unreadable response; the result is unknown.") from None
+
+
+def _response_code(response: dict[str, Any]) -> int | None:
+    value = response.get("code")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.lstrip("-").isdigit():
+        return int(value)
+    return None
+
+
+def _response_message(response: dict[str, Any]) -> str:
+    value = response.get("message") or response.get("msg")
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _known_auth_failure(response: dict[str, Any]) -> bool:
+    code = _response_code(response)
+    message = _response_message(response)
+    if code == 301:
+        return True
+    auth_phrases = ("need login", "not login", "login expired", "未登录", "登录过期")
+    return code in {400, 401} and any(phrase in message for phrase in auth_phrases)
+
+
+def _ambiguous_request_rejection(
+    response: dict[str, Any], http_status: int | None = None
+) -> bool:
+    code = _response_code(response)
+    message = _response_message(response)
+    return http_status == 403 or code == 403 or "illegal request" in message
+
+
+def _expire_current_session() -> None:
+    _session_manager().invalidate()
+    raise NetEaseAuthExpired()
+
+
+def verify_netease_session(*, force: bool = False) -> dict[str, Any]:
+    manager = _session_manager()
+    session = manager.current()
+    if session is None:
+        raise NetEaseAuthExpired()
+    raw_user_id = session.get("user_id")
+    if (
+        not force
+        and manager.verification_is_fresh(session)
+        and isinstance(raw_user_id, str)
+        and raw_user_id.isdigit()
+    ):
+        return {"authenticated": True, "user_id": int(raw_user_id), "cached": True}
+    try:
+        response, _ = _raw_netease_request(
+            "https://music.163.com/api/nuser/account/get",
+            cookie=str(session["cookie"]),
+        )
+    except NetEaseHTTPFailure as exc:
+        if _known_auth_failure(exc.payload):
+            _expire_current_session()
+        raise NetEaseRequestRejected(
+            f"NETEASE_REQUEST_REJECTED: NetEase rejected session verification with HTTP {exc.status}; authentication expiry was not established."
+        ) from None
+    if _known_auth_failure(response):
+        _expire_current_session()
+    if _response_code(response) not in (None, 200):
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase rejected session verification; authentication expiry was not established."
+        )
+    profile = response.get("profile") or {}
+    account = response.get("account") or {}
+    user_id = profile.get("userId") or account.get("id")
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        _expire_current_session()
+    manager.mark_verified(user_id)
+    return {"authenticated": True, "user_id": user_id, "cached": False}
+
+
+def _raise_ambiguous_rejection() -> None:
+    try:
+        verify_netease_session(force=True)
+    except NetEaseAuthExpired:
+        raise
+    except NetEaseError:
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase rejected the request, and session verification could not establish that the login expired."
+        ) from None
+    raise NetEaseRequestRejected(
+        "NETEASE_REQUEST_REJECTED: NetEase rejected the request while the current login still verifies as active."
+    )
+
+
+def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[str, Any]:
+    cookie = _require_cookie()
+    try:
+        result, _ = _raw_netease_request(url, cookie=cookie, data=data)
+    except NetEaseHTTPFailure as exc:
+        if _known_auth_failure(exc.payload):
+            _expire_current_session()
+        if _ambiguous_request_rejection(exc.payload, exc.status):
+            _raise_ambiguous_rejection()
+        raise NetEaseError(
+            f"NETEASE_UPSTREAM_ERROR: NetEase request failed with HTTP {exc.status}."
+        ) from None
+    if _known_auth_failure(result):
+        _expire_current_session()
+    if _ambiguous_request_rejection(result):
+        _raise_ambiguous_rejection()
+    return result
 
 
 def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> dict[str, Any]:
@@ -594,21 +816,268 @@ def netease_binary_request(url: str, data: bytes, headers: dict[str, str]) -> di
 
 
 def get_csrf() -> str:
-    for part in NETEASE_COOKIE.split(";"):
-        part = part.strip()
-        if part.startswith("__csrf="):
-            return part.split("=", 1)[1]
-    return ""
+    return _session_manager().get_csrf()
 
 
 def get_uid() -> int:
+    manager = _session_manager()
+    session = manager.current()
+    raw_user_id = (session or {}).get("user_id")
+    if (
+        manager.verification_is_fresh(session)
+        and isinstance(raw_user_id, str)
+        and raw_user_id.isdigit()
+    ):
+        return int(raw_user_id)
     response = netease_request("https://music.163.com/api/nuser/account/get")
     profile = response.get("profile") or {}
     account = response.get("account") or {}
     uid = profile.get("userId") or account.get("id")
-    if not isinstance(uid, int):
-        raise NetEaseError("Could not identify the NetEase user. The cookie may have expired.")
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
+        _expire_current_session()
+    manager.mark_verified(uid)
     return uid
+
+
+def _netease_qr_request(
+    path: str, data: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    payload = {**data, "csrf_token": ""}
+    encrypted = weapi_encrypt(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    url = "https://music.163.com/weapi/" + path.removeprefix("/api/").lstrip("/")
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(encrypted).encode("ascii"),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            ),
+            "Referer": "https://music.163.com/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = _decode_netease_payload(response.read(1_000_000))
+            headers = response.headers.get_all("Set-Cookie") or []
+            return result, headers
+    except urllib.error.HTTPError as exc:
+        raise NetEaseRequestRejected(
+            f"NETEASE_REQUEST_REJECTED: NetEase rejected the QR login request with HTTP {exc.code}."
+        ) from None
+    except urllib.error.URLError:
+        raise UpstreamOutcomeUnknown(
+            "NetEase QR login could not be reached; no login state was changed."
+        ) from None
+
+
+def get_netease_login_status() -> str:
+    manager = _session_manager()
+    status = manager.public_status()
+    if manager.current() is None:
+        status.update(
+            {
+                "authenticated": False,
+                "next_tool": "start_netease_qr_login",
+            }
+        )
+        return _json_text(status)
+    try:
+        verification = verify_netease_session()
+    except NetEaseAuthExpired:
+        status.update(
+            {
+                "status": "expired",
+                "authenticated": False,
+                "next_tool": "start_netease_qr_login",
+            }
+        )
+    except NetEaseError as exc:
+        status.update(
+            {
+                "status": "verification_inconclusive",
+                "authenticated": None,
+                "error_code": getattr(exc, "code", "NETEASE_UPSTREAM_ERROR"),
+                "next_tool": "get_netease_login_status",
+            }
+        )
+    else:
+        status.update(
+            {
+                "status": "authenticated",
+                "authenticated": True,
+                "verification_cached": verification["cached"],
+                "last_verified_at": manager.public_status().get("last_verified_at"),
+                "next_tool": None,
+            }
+        )
+    return _json_text(status)
+
+
+def _cleanup_qr_attempts(now: float) -> None:
+    expired_before = now - QR_LOGIN_TTL_SECONDS
+    for login_id, attempt in list(QR_LOGIN_ATTEMPTS.items()):
+        if float(attempt.get("created_monotonic", 0)) < expired_before:
+            QR_LOGIN_ATTEMPTS.pop(login_id, None)
+
+
+def start_netease_qr_login() -> str:
+    manager = _session_manager()
+    if not manager.storage_configured:
+        raise NetEaseError(
+            "NETEASE_SESSION_STORAGE_REQUIRED: Set MCP_STORAGE_PATH to a SQLite file on a persistent volume before QR login."
+        )
+    response, _ = _netease_qr_request(
+        "/api/login/qrcode/unikey", {"type": 3}
+    )
+    data = response.get("data") if isinstance(response.get("data"), dict) else response
+    key = data.get("unikey") if isinstance(data, dict) else None
+    if _response_code(response) not in (None, 200) or not isinstance(key, str) or not key:
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase did not create a usable QR login key."
+        )
+    login_id = secrets.token_urlsafe(24)
+    qr_url = "https://music.163.com/login?codekey=" + urllib.parse.quote(key, safe="")
+    now = time.monotonic()
+    with QR_LOGIN_LOCK:
+        _cleanup_qr_attempts(now)
+        QR_LOGIN_ATTEMPTS[login_id] = {
+            "key": key,
+            "status": "waiting",
+            "created_monotonic": now,
+            "last_checked_monotonic": 0.0,
+        }
+    return _json_text(
+        {
+            "login_id": login_id,
+            "status": "waiting",
+            "qr_payload": qr_url,
+            "qr_url": qr_url,
+            "expires_in_seconds": QR_LOGIN_TTL_SECONDS,
+            "minimum_check_interval_seconds": QR_LOGIN_MIN_CHECK_SECONDS,
+            "instructions": (
+                "Render qr_payload as a QR code, then scan and confirm it in the NetEase App. "
+                "After confirmation, call check_netease_qr_login with login_id."
+            ),
+        }
+    )
+
+
+def check_netease_qr_login(login_id: Any) -> str:
+    if not isinstance(login_id, str) or not 16 <= len(login_id) <= 100:
+        raise ValueError("login_id must be the value returned by start_netease_qr_login.")
+    now = time.monotonic()
+    with QR_LOGIN_LOCK:
+        _cleanup_qr_attempts(now)
+        attempt = QR_LOGIN_ATTEMPTS.get(login_id)
+        if attempt is None:
+            return _json_text(
+                {
+                    "login_id": login_id,
+                    "status": "expired",
+                    "next_tool": "start_netease_qr_login",
+                }
+            )
+        if attempt.get("status") in {"confirmed", "expired"}:
+            terminal_status = str(attempt["status"])
+            return _json_text(
+                {
+                    "login_id": login_id,
+                    "status": terminal_status,
+                    "session_persisted": terminal_status == "confirmed",
+                    "next_tool": "start_netease_qr_login"
+                    if terminal_status == "expired"
+                    else None,
+                }
+            )
+        elapsed = now - float(attempt.get("last_checked_monotonic", 0))
+        if attempt.get("last_checked_monotonic") and elapsed < QR_LOGIN_MIN_CHECK_SECONDS:
+            return _json_text(
+                {
+                    "login_id": login_id,
+                    "status": attempt["status"],
+                    "throttled": True,
+                    "retry_after_seconds": round(QR_LOGIN_MIN_CHECK_SECONDS - elapsed, 2),
+                }
+            )
+        attempt["last_checked_monotonic"] = now
+        key = str(attempt["key"])
+
+    response, set_cookie_headers = _netease_qr_request(
+        "/api/login/qrcode/client/login", {"key": key, "type": 3}
+    )
+    code = _response_code(response)
+    statuses = {800: "expired", 801: "waiting", 802: "scanned", 803: "confirmed"}
+    status = statuses.get(code)
+    if status is None:
+        raise NetEaseRequestRejected(
+            "NETEASE_REQUEST_REJECTED: NetEase returned an unknown QR login status."
+        )
+
+    if status == "confirmed":
+        cookie = cookie_from_login_response(
+            set_cookie_headers,
+            response.get("cookie"),
+        )
+        if not parse_cookie(cookie).get("MUSIC_U"):
+            raise NetEaseRequestRejected(
+                "NETEASE_REQUEST_REJECTED: NetEase confirmed the QR login but did not return a usable session."
+            )
+        _session_manager().save(cookie, source="qr_login")
+        verification_state = "verified"
+        try:
+            verify_netease_session(force=True)
+        except NetEaseAuthExpired:
+            raise
+        except NetEaseError:
+            verification_state = "pending"
+        with QR_LOGIN_LOCK:
+            current = QR_LOGIN_ATTEMPTS.get(login_id)
+            if current is not None:
+                current.update({"key": "", "status": "confirmed"})
+        return _json_text(
+            {
+                "login_id": login_id,
+                "status": "confirmed",
+                "session_persisted": True,
+                "verification": verification_state,
+                "next_tool": "get_netease_login_status"
+                if verification_state == "pending"
+                else None,
+            }
+        )
+
+    with QR_LOGIN_LOCK:
+        current = QR_LOGIN_ATTEMPTS.get(login_id)
+        if current is not None:
+            current["status"] = status
+            if status == "expired":
+                current["key"] = ""
+    return _json_text(
+        {
+            "login_id": login_id,
+            "status": status,
+            "retry_after_seconds": QR_LOGIN_MIN_CHECK_SECONDS
+            if status in {"waiting", "scanned"}
+            else None,
+            "next_tool": "start_netease_qr_login" if status == "expired" else None,
+        }
+    )
+
+
+def logout_netease() -> str:
+    _session_manager().logout()
+    return _json_text(
+        {
+            "status": "logged_out",
+            "session_cleared": True,
+            "next_tool": "start_netease_qr_login",
+        }
+    )
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -3212,6 +3681,8 @@ def _execute_direct_write(operation: str, raw_arguments: dict[str, Any]) -> str:
         if raw_idempotency_key is not None
         else None
     )
+    # get_uid() verifies only when the 15-minute cache is stale, so writes do
+    # not add a login-status request on every call.
     user_id = get_uid()
     if idempotency_key is not None:
         existing = _store().get_operation_by_idempotency(
@@ -3284,6 +3755,14 @@ def call_tool(name: str, arguments: dict[str, Any]) -> str:
         raise PermissionError("Write tools are disabled. Set MCP_READ_ONLY=false to enable them.")
     if name in WRITE_TOOL_NAMES:
         return _execute_direct_write(name, arguments)
+    if name == "get_netease_login_status":
+        return get_netease_login_status()
+    if name == "start_netease_qr_login":
+        return start_netease_qr_login()
+    if name == "check_netease_qr_login":
+        return check_netease_qr_login(arguments.get("login_id"))
+    if name == "logout_netease":
+        return logout_netease()
     if name == "search_song":
         return search_song(arguments.get("query"), arguments.get("limit", 5))
     if name == "list_my_playlists":
@@ -3367,8 +3846,11 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "netease-music-mcp-safe", "version": "4.0.0"},
+                "serverInfo": {"name": "netease-music-mcp-safe", "version": "5.0.0"},
                 "instructions": (
+                    "NetEase login is managed as a deployment-level persisted session. When an "
+                    "operation reports NETEASE_AUTH_EXPIRED, use start_netease_qr_login and "
+                    "check_netease_qr_login; never ask the user to paste a cookie. "
                     "Write tools execute in one call after parameter, ownership, and state checks. "
                     "Use create_curated_playlist when name, description, privacy, and the final "
                     "song order are known; it requires an idempotency_key and verifies the result. "
@@ -3388,11 +3870,24 @@ def handle_jsonrpc(body: dict[str, Any]) -> dict[str, Any] | None:
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be an object.")
-        result = call_tool(str(params.get("name", "")), arguments)
+        tool_name = str(params.get("name", ""))
+        result = call_tool(tool_name, arguments)
+        content: list[dict[str, Any]] = [{"type": "text", "text": result}]
+        if tool_name == "start_netease_qr_login":
+            qr_result = json.loads(result)
+            qr_payload = qr_result.get("qr_payload")
+            if isinstance(qr_payload, str):
+                content.append(
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(qr_png(qr_payload)).decode("ascii"),
+                        "mimeType": "image/png",
+                    }
+                )
         return {
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {"content": [{"type": "text", "text": result}]},
+            "result": {"content": content},
         }
     if isinstance(method, str) and method.startswith("notifications/"):
         return None
@@ -3630,7 +4125,7 @@ def exchange_oauth_token(params: dict[str, str]) -> dict[str, Any]:
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "NetEaseMusicMCP/4.0"
+    server_version = "NetEaseMusicMCP/5.0"
 
     def _cors(self) -> None:
         if ALLOWED_ORIGIN:
@@ -3738,6 +4233,11 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if write_requested
             else "Authorize read-only access to your NetEase playlists, history, search and recommendations."
         )
+        if "netease.session" in requested_scopes:
+            access_text += (
+                " This also allows starting, checking, persisting, and clearing the deployment-level "
+                "NetEase QR login session; the client never receives the resulting cookie."
+            )
         write_confirmation = (
             '<label class="warning"><input type="checkbox" name="confirm_write" value="yes" required> '
             "I understand this grants permission to modify my NetEase account.</label>"
@@ -3890,12 +4390,20 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if tool_call:
                 params = body.get("params") or {}
                 tool_name = str(params.get("name", "")) if isinstance(params, dict) else ""
-                if tool_name in WRITE_TOOL_NAMES and not self._static_token_authorized():
+                if (
+                    tool_name in WRITE_TOOL_NAMES | SESSION_MUTATING_TOOL_NAMES
+                    and not self._static_token_authorized()
+                ):
                     claims = self._oauth_access_claims() or {}
-                    if "netease.write" not in str(claims.get("scope", "")).split():
+                    required_scope = (
+                        "netease.write"
+                        if tool_name in WRITE_TOOL_NAMES
+                        else "netease.session"
+                    )
+                    if required_scope not in str(claims.get("scope", "")).split():
                         self._json(
                             tool_error_response(
-                                request_id, "netease.write scope is required"
+                                request_id, f"{required_scope} scope is required"
                             )
                         )
                         return
@@ -4006,6 +4514,8 @@ def validate_startup() -> None:
         raise SystemExit("Replace the example MCP_OAUTH_PASSWORD before starting.")
     if OAUTH_PASSWORD and hmac.compare_digest(OAUTH_PASSWORD, ACCESS_TOKEN):
         raise SystemExit("MCP_OAUTH_PASSWORD must be different from MCP_ACCESS_TOKEN.")
+    if STORAGE_PATH:
+        _store()
 
 
 def main() -> None:

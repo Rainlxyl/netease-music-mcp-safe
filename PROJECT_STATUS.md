@@ -1,7 +1,18 @@
 # 项目状态
 
-最后更新：2026-08-31
+最后更新：2026-09-28
 状态维护者：项目协作者
+
+## 2026-09-28 网易云登录态自动管理 checkpoint
+
+- canonical working tree：`repo_checkout`，分支 `main`，任务开始时 HEAD `2d72f141e2337d2f4539cb846dc32ffe8d5ecfca`，origin 为 `Rainlxyl/netease-music-mcp-safe`。未修改 `upstream_reference` 或项目外壳目录。
+- 已在当前工作区实现统一 session manager、SQLite runtime session、环境变量兼容回退、二维码登录、登出、登录状态工具、CSRF 统一解析与认证错误分类；本轮没有部署或 push。
+- 当前工具边界为 16 个音乐读取工具、4 个登录态工具、12 个可选写入工具。默认只读策略和 single-call write 保护保持不变。
+- SQLite schema 在现有初始化流程中自动创建 `netease_session` 单例表，不需要手工 migration。二维码登录依赖既有 `MCP_STORAGE_PATH` 指向持久卷；未新增环境变量。
+- 安全边界：仅持久化 allowlist 中的 `MUSIC_U` 与 `__csrf`；数据库、WAL 与备份视为秘密；MCP 返回、日志和异常不返回 Cookie/CSRF/token。当前个人单实例部署不新增应用层加密密钥，详见 `DEC-007` 和 `SECURITY.md`。
+- 本地自动化使用 mock 覆盖 session 优先级、持久化、CSRF、错误分类、二维码全部状态、确认后保存、MCP PNG image content、OAuth scope 兼容、旧数据库数据保留、登出与秘密不泄露。2026-09-28 当前工作区完整测试 102/102 通过，仓库 `check_dev_environment.ps1`、Python compile、`pip check` 与 `git diff --check` 通过。真实网易云账户、二维码在线接口、Zeabur runtime 与 OAuth 回调仍未在本轮验证，不得把本地测试描述为线上验收。
+- 既有 `README.md` 未提交 attribution 修改是在其当前工作区版本上合并保留；3 份 `CODEX_FOR_OSS_*` 未跟踪文档未删除、未移动、未纳入本次实现。
+- 下一步：Rain 审阅本地 commit 后，再单独决定是否 push 与部署。
 
 ## 2026-08-31 continuity refresh
 

@@ -1,4 +1,4 @@
-"""Bounded SQLite persistence for operation previews, logs, and private notes."""
+"""Bounded SQLite persistence for sessions, operation logs, and private notes."""
 
 from __future__ import annotations
 
@@ -145,6 +145,17 @@ class PersistentStore:
                     );
                     CREATE INDEX IF NOT EXISTS notes_query_idx
                         ON interaction_notes(user_id, playlist_id, song_id, author, created_at);
+
+                    CREATE TABLE IF NOT EXISTS netease_session (
+                        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                        cookie TEXT NOT NULL,
+                        csrf TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        last_verified_at TEXT,
+                        user_id TEXT
+                    );
                     """
                 )
                 operation_columns = {
@@ -171,7 +182,49 @@ class PersistentStore:
                     "ON operations(user_id, operation, idempotency_key) "
                     "WHERE idempotency_key IS NOT NULL"
                 )
+                try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
             self._initialized = True
+
+    def load_netease_session(self) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cookie, csrf, status, source, updated_at, "
+                "last_verified_at, user_id FROM netease_session WHERE singleton_id=1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_netease_session(self, record: dict[str, Any]) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO netease_session (
+                    singleton_id, cookie, csrf, status, source, updated_at,
+                    last_verified_at, user_id
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    cookie=excluded.cookie,
+                    csrf=excluded.csrf,
+                    status=excluded.status,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at,
+                    last_verified_at=excluded.last_verified_at,
+                    user_id=excluded.user_id
+                """,
+                (
+                    record.get("cookie", ""),
+                    record.get("csrf", ""),
+                    record["status"],
+                    record["source"],
+                    record["updated_at"],
+                    record.get("last_verified_at"),
+                    str(record["user_id"]) if record.get("user_id") is not None else None,
+                ),
+            )
 
     @staticmethod
     def _json(value: Any) -> str | None:

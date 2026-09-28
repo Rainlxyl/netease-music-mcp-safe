@@ -82,13 +82,16 @@ class ToolTests(unittest.TestCase):
     def test_read_only_lists_only_read_tools(self):
         module = load_server("true")
         names = {tool["name"] for tool in module.available_tools()}
-        self.assertEqual(names, module.READ_TOOL_NAMES)
+        self.assertEqual(names, module.READ_TOOL_NAMES | module.SESSION_TOOL_NAMES)
         self.assertTrue(names.isdisjoint(module.WRITE_TOOL_NAMES))
 
     def test_write_mode_lists_all_tools(self):
         module = load_server("false")
         names = {tool["name"] for tool in module.available_tools()}
-        self.assertEqual(names, module.READ_TOOL_NAMES | module.WRITE_TOOL_NAMES)
+        self.assertEqual(
+            names,
+            module.READ_TOOL_NAMES | module.SESSION_TOOL_NAMES | module.WRITE_TOOL_NAMES,
+        )
 
     def test_every_listed_tool_has_a_call_dispatch_path(self):
         module = load_server("false")
@@ -109,6 +112,10 @@ class ToolTests(unittest.TestCase):
             "daily_recommend": mock.DEFAULT,
             "get_operation_log": mock.DEFAULT,
             "list_interaction_notes": mock.DEFAULT,
+            "get_netease_login_status": mock.DEFAULT,
+            "start_netease_qr_login": mock.DEFAULT,
+            "check_netease_qr_login": mock.DEFAULT,
+            "logout_netease": mock.DEFAULT,
         }
         with mock.patch.multiple(module, **read_handlers) as handlers, mock.patch.object(
             module, "_execute_direct_write", return_value="dispatched"
@@ -174,7 +181,10 @@ class ToolTests(unittest.TestCase):
 
     def test_write_mode_advertises_write_oauth_scope(self):
         module = load_server("false", oauth=True)
-        self.assertEqual(module.OAUTH_SCOPE, "netease.read netease.write")
+        self.assertEqual(
+            module.OAUTH_SCOPE,
+            "netease.read netease.session netease.write",
+        )
 
     def test_read_only_rejects_direct_write_call(self):
         module = load_server("true")
@@ -906,6 +916,244 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(payload["playlist_id"], 99)
         self.assertEqual(request.call_args_list[2].kwargs["data"]["op"], "update")
         self.assertEqual(request.call_args_list[2].kwargs["data"]["trackIds"], "[3,2,1]")
+
+
+class NetEaseSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.module = load_server("true")
+
+    def tearDown(self):
+        self.module.SESSION_MANAGER = None
+        self.module.STORE_INSTANCE = None
+        self.tempdir.cleanup()
+
+    def configure_storage(self):
+        self.module.STORAGE_PATH = str(Path(self.tempdir.name) / "session.sqlite3")
+        self.module.STORE_INSTANCE = None
+        self.module.SESSION_MANAGER = None
+        return self.module._store()
+
+    def test_environment_cookie_remains_a_supported_fallback(self):
+        manager = self.module._session_manager()
+        session = manager.current()
+        self.assertEqual(session["source"], "environment")
+        self.assertEqual(manager.get_csrf(), "test")
+        self.assertIn("MUSIC_U=test", manager.get_cookie())
+
+    def test_environment_cookie_accepts_legacy_extra_fields_without_storage(self):
+        self.module.NETEASE_COOKIE = (
+            "os=pc; MUSIC_U=legacy-synthetic; NMTID=ignored; "
+            "__csrf=old; __csrf=current; rememberLogin=true"
+        )
+        self.module.STORAGE_PATH = ""
+        self.module.SESSION_MANAGER = None
+        self.module.validate_startup()
+        manager = self.module._session_manager()
+        self.assertFalse(manager.storage_configured)
+        self.assertEqual(
+            manager.get_cookie(),
+            "MUSIC_U=legacy-synthetic; __csrf=current",
+        )
+        self.assertEqual(manager.get_csrf(), "current")
+
+    def test_persistent_session_is_saved_loaded_and_preferred(self):
+        store = self.configure_storage()
+        store.save_netease_session(
+            {
+                "cookie": "MUSIC_U=persisted; __csrf=persisted-csrf",
+                "csrf": "persisted-csrf",
+                "status": "active",
+                "source": "qr_login",
+                "updated_at": utc_now(),
+                "last_verified_at": None,
+                "user_id": None,
+            }
+        )
+        loaded = store.load_netease_session()
+        self.assertEqual(loaded["status"], "active")
+        self.assertEqual(loaded["csrf"], "persisted-csrf")
+        manager = self.module._session_manager()
+        self.assertEqual(manager.current()["source"], "qr_login")
+        self.assertEqual(manager.get_csrf(), "persisted-csrf")
+
+    def test_csrf_parsing_uses_the_last_duplicate(self):
+        from netease_session import extract_csrf, normalize_session_cookie
+
+        raw = "__csrf=old; MUSIC_U=synthetic; __csrf=new"
+        self.assertEqual(extract_csrf(raw), "new")
+        self.assertEqual(
+            normalize_session_cookie(raw),
+            "MUSIC_U=synthetic; __csrf=new",
+        )
+
+    def test_explicit_login_failure_invalidates_the_current_session(self):
+        with mock.patch.object(
+            self.module,
+            "_raw_netease_request",
+            return_value=({"code": 301, "message": "需要登录"}, {}),
+        ):
+            with self.assertRaises(self.module.NetEaseAuthExpired) as context:
+                self.module.verify_netease_session(force=True)
+        self.assertIn("NETEASE_AUTH_EXPIRED", str(context.exception))
+        self.assertIsNone(self.module._session_manager().current())
+
+    def test_plain_403_is_not_misclassified_as_auth_expired(self):
+        account = {
+            "code": 200,
+            "profile": {"userId": 7},
+            "account": {"id": 7},
+        }
+        side_effect = [
+            self.module.NetEaseHTTPFailure(403, {"code": 403, "message": "illegal request"}),
+            (account, {}),
+        ]
+        with mock.patch.object(
+            self.module, "_raw_netease_request", side_effect=side_effect
+        ):
+            with self.assertRaises(self.module.NetEaseRequestRejected) as context:
+                self.module.netease_request("https://music.163.com/api/test")
+        self.assertIn("NETEASE_REQUEST_REJECTED", str(context.exception))
+        self.assertNotIsInstance(context.exception, self.module.NetEaseAuthExpired)
+        self.assertIsNotNone(self.module._session_manager().current())
+
+    def test_qr_status_transitions_waiting_scanned_and_expired(self):
+        self.configure_storage()
+        cases = {801: "waiting", 802: "scanned", 800: "expired"}
+        for index, (code, expected) in enumerate(cases.items(), 1):
+            login_id = f"synthetic-login-id-{index:02d}"
+            self.module.QR_LOGIN_ATTEMPTS[login_id] = {
+                "key": f"synthetic-key-{index}",
+                "status": "waiting",
+                "created_monotonic": self.module.time.monotonic(),
+                "last_checked_monotonic": 0.0,
+            }
+            with mock.patch.object(
+                self.module,
+                "_netease_qr_request",
+                return_value=({"code": code}, []),
+            ):
+                result = json.loads(self.module.check_netease_qr_login(login_id))
+            self.assertEqual(result["status"], expected)
+
+    def test_start_qr_login_returns_only_safe_rendering_data(self):
+        self.configure_storage()
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 200, "unikey": "synthetic-qr-key"}, []),
+        ):
+            raw_result = self.module.start_netease_qr_login()
+        result = json.loads(raw_result)
+        self.assertEqual(result["status"], "waiting")
+        self.assertIn("codekey=synthetic-qr-key", result["qr_payload"])
+        self.assertIn("login_id", result)
+        self.assertNotIn("MUSIC_U", raw_result)
+        self.assertNotIn("__csrf", raw_result)
+
+    def test_start_qr_login_mcp_result_contains_text_url_and_png(self):
+        self.configure_storage()
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 200, "unikey": "synthetic-image-key"}, []),
+        ):
+            response = self.module.handle_jsonrpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 91,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_netease_qr_login",
+                        "arguments": {},
+                    },
+                }
+            )
+        content = response["result"]["content"]
+        self.assertEqual([item["type"] for item in content], ["text", "image"])
+        text_result = json.loads(content[0]["text"])
+        self.assertEqual(text_result["qr_url"], text_result["qr_payload"])
+        self.assertTrue(text_result["qr_url"].startswith("https://music.163.com/"))
+        self.assertEqual(content[1]["mimeType"], "image/png")
+        image_data = base64.b64decode(content[1]["data"], validate=True)
+        with Image.open(io.BytesIO(image_data)) as image:
+            self.assertEqual(image.format, "PNG")
+            self.assertGreater(image.width, 100)
+
+    def test_weapi_qr_payload_encryption_has_expected_form_fields(self):
+        from netease_session import weapi_encrypt
+
+        encrypted = weapi_encrypt('{"type":3}', "abcdefghijklmnop")
+        self.assertEqual(set(encrypted), {"params", "encSecKey"})
+        self.assertTrue(encrypted["params"])
+        self.assertEqual(len(encrypted["encSecKey"]), 256)
+        int(encrypted["encSecKey"], 16)
+
+    def test_confirmed_qr_login_persists_session_without_returning_it(self):
+        store = self.configure_storage()
+        login_id = "synthetic-confirmed-login-id"
+        self.module.QR_LOGIN_ATTEMPTS[login_id] = {
+            "key": "synthetic-key",
+            "status": "waiting",
+            "created_monotonic": self.module.time.monotonic(),
+            "last_checked_monotonic": 0.0,
+        }
+        headers = [
+            "MUSIC_U=qr-secret; Path=/; HttpOnly",
+            "__csrf=qr-csrf; Path=/; Secure",
+        ]
+        with mock.patch.object(
+            self.module,
+            "_netease_qr_request",
+            return_value=({"code": 803}, headers),
+        ), mock.patch.object(
+            self.module,
+            "verify_netease_session",
+            return_value={"authenticated": True, "user_id": 7, "cached": False},
+        ):
+            raw_result = self.module.check_netease_qr_login(login_id)
+        result = json.loads(raw_result)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertTrue(result["session_persisted"])
+        persisted = store.load_netease_session()
+        self.assertIn("MUSIC_U=qr-secret", persisted["cookie"])
+        self.assertEqual(persisted["csrf"], "qr-csrf")
+        self.assertNotIn("qr-secret", raw_result)
+        self.assertNotIn("qr-csrf", raw_result)
+
+    def test_logout_clears_runtime_cookie_and_does_not_expose_secrets(self):
+        store = self.configure_storage()
+        self.module._session_manager().save(
+            "MUSIC_U=logout-secret; __csrf=logout-csrf",
+            source="qr_login",
+        )
+        result = self.module.logout_netease()
+        persisted = store.load_netease_session()
+        self.assertEqual(persisted["status"], "logged_out")
+        self.assertEqual(persisted["cookie"], "")
+        self.assertIsNone(self.module._session_manager().current())
+        self.assertNotIn("logout-secret", result)
+        self.assertNotIn("logout-csrf", result)
+
+    def test_status_and_redaction_never_return_session_values(self):
+        self.configure_storage()
+        self.module._session_manager().save(
+            "MUSIC_U=private-value; __csrf=private-csrf",
+            source="qr_login",
+        )
+        with mock.patch.object(
+            self.module,
+            "verify_netease_session",
+            return_value={"authenticated": True, "user_id": 7, "cached": True},
+        ):
+            status = self.module.get_netease_login_status()
+        redacted = self.module._redact_secrets(
+            "MUSIC_U=private-value; __csrf=private-csrf"
+        )
+        for secret in ("private-value", "private-csrf"):
+            self.assertNotIn(secret, status)
+            self.assertNotIn(secret, redacted)
+        self.assertIn("[REDACTED]", redacted)
 
 
 class PersistenceAuditAndCoverTests(unittest.TestCase):
@@ -2222,11 +2470,24 @@ class DirectWriteTests(unittest.TestCase):
             indexes = {
                 row[1] for row in connection.execute("PRAGMA index_list(operations)")
             }
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            legacy_row = connection.execute(
+                "SELECT operation, sanitized_arguments_json FROM operations "
+                "WHERE operation_id='legacy-started'"
+            ).fetchone()
         finally:
             connection.close()
         self.assertIn("upstream_action_started", columns)
         self.assertIn("idempotency_key", columns)
         self.assertIn("operations_idempotency_idx", indexes)
+        self.assertIn("netease_session", tables)
+        self.assertEqual(legacy_row, ("like_song", '{"like":true,"song_id":1}'))
+        self.assertIsNone(store.load_netease_session())
 
         for operation_id in ("before-crash", "after-crash"):
             store.start_operation(
@@ -2303,7 +2564,10 @@ class HTTPTests(unittest.TestCase):
         ) as response:
             body = json.loads(response.read())
         names = {tool["name"] for tool in body["result"]["tools"]}
-        self.assertEqual(names, self.module.READ_TOOL_NAMES)
+        self.assertEqual(
+            names,
+            self.module.READ_TOOL_NAMES | self.module.SESSION_TOOL_NAMES,
+        )
 
     def test_tool_failure_is_returned_as_mcp_error_content(self):
         with mock.patch.object(
@@ -2476,7 +2740,8 @@ class OAuthHTTPTests(unittest.TestCase):
         ) as response:
             body = json.loads(response.read())
         self.assertEqual(
-            {tool["name"] for tool in body["result"]["tools"]}, self.module.READ_TOOL_NAMES
+            {tool["name"] for tool in body["result"]["tools"]},
+            self.module.READ_TOOL_NAMES | self.module.SESSION_TOOL_NAMES,
         )
 
         with self.post_form(
@@ -2497,8 +2762,98 @@ class OAuthHTTPTests(unittest.TestCase):
             retried = json.loads(response.read())
         self.assertEqual(
             {tool["name"] for tool in retried["result"]["tools"]},
-            self.module.READ_TOOL_NAMES,
+            self.module.READ_TOOL_NAMES | self.module.SESSION_TOOL_NAMES,
         )
+
+    def test_session_scope_is_advertised_issued_enforced_and_refreshable(self):
+        advertised = set(self.module.OAUTH_SCOPE.split())
+        self.assertEqual(advertised, {"netease.read", "netease.session"})
+        for path in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ):
+            with urllib.request.urlopen(self.base + path, timeout=2) as response:
+                metadata = json.loads(response.read())
+            self.assertEqual(set(metadata["scopes_supported"]), advertised)
+
+        client = self.register()
+        verifier = "s" * 64
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        params = {
+            "client_id": client["client_id"],
+            "redirect_uri": "https://client.example/callback",
+            "response_type": "code",
+            "scope": "netease.read netease.session",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": "https://music.example.test/mcp",
+        }
+        code = self.module.issue_authorization_code(params)
+        with self.post_form(
+            "/token",
+            {
+                "grant_type": "authorization_code",
+                "client_id": client["client_id"],
+                "redirect_uri": "https://client.example/callback",
+                "code": code,
+                "code_verifier": verifier,
+            },
+        ) as response:
+            tokens = json.loads(response.read())
+        self.assertEqual(set(tokens["scope"].split()), advertised)
+
+        with self.post_form(
+            "/token",
+            {
+                "grant_type": "refresh_token",
+                "client_id": client["client_id"],
+                "refresh_token": tokens["refresh_token"],
+            },
+        ) as response:
+            refreshed = json.loads(response.read())
+        self.assertEqual(set(refreshed["scope"].split()), advertised)
+
+        safe_result = json.dumps(
+            {
+                "login_id": "synthetic-oauth-login-id",
+                "status": "waiting",
+                "qr_payload": "https://music.163.com/login?codekey=synthetic",
+                "qr_url": "https://music.163.com/login?codekey=synthetic",
+            }
+        )
+        tool_call = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "start_netease_qr_login", "arguments": {}},
+        }
+        with mock.patch.object(
+            self.module, "start_netease_qr_login", return_value=safe_result
+        ):
+            with self.post_json("/mcp", tool_call, refreshed["access_token"]) as response:
+                allowed = json.loads(response.read())
+        self.assertFalse(allowed["result"].get("isError", False))
+        self.assertEqual(
+            [item["type"] for item in allowed["result"]["content"]],
+            ["text", "image"],
+        )
+
+        legacy_token = self.module._token_pair(
+            client["client_id"], "netease.read", include_refresh=False
+        )["access_token"]
+        with self.post_json("/mcp", tool_call, legacy_token) as response:
+            rejected = json.loads(response.read())
+        self.assertTrue(rejected["result"]["isError"])
+        self.assertIn("netease.session scope is required", rejected["result"]["content"][0]["text"])
+        with self.post_json(
+            "/mcp",
+            {"jsonrpc": "2.0", "id": 8, "method": "tools/list"},
+            legacy_token,
+        ) as response:
+            legacy_list = json.loads(response.read())
+        self.assertIn("tools", legacy_list["result"])
 
     def test_authorization_code_cannot_be_reused(self):
         client = self.register()

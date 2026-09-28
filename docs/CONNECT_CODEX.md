@@ -34,6 +34,13 @@ If the server is later changed from read-only to write mode, refresh the app's t
 disconnect it, and reconnect it. Existing refresh tokens retain their original read-only scope and
 must not be silently upgraded. The new authorization page will explicitly request write access.
 
+After deploying session management, reconnect once so the app can receive the `netease.session`
+scope. Run `start_netease_qr_login`; its MCP result includes text with a direct NetEase HTTPS
+`qr_url` plus a PNG image content block, so the client does not need to turn the text payload into
+an image itself. Scan and confirm it in the NetEase App, then call `check_netease_qr_login` with the
+returned `login_id`. The resulting Cookie is stored only on the server and is never returned to the
+client.
+
 Also refresh, disconnect, and reconnect after deploying new tools or changing their input schema;
 otherwise ChatGPT may continue using a cached tool list from the previous deployment.
 
